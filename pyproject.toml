@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dp2-skykatana-mask"
+version = "0.1.0"
+description = "Memory-safe (32 GB RSP) DP2 survey property & Monster bright-star spatial masks built with SkyKatana"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [
+    { name = "Mariano Dominguez & Rubin/DESC Contributors" }
+]
+keywords = ["astronomy", "rubin", "lsst", "dp2", "skykatana", "healsparse", "footprint", "mask"]
+dependencies = [
+    "numpy>=1.24",
+    "pandas>=2.0",
+    "pyarrow>=12.0",
+    "astropy>=5.3",
+    "pyyaml>=6.0",
+    "healsparse>=1.9",
+    "hpgeom>=1.1",
+    "mocpy>=0.15",
+    "matplotlib>=3.7",
+    "skykatana>=0.2.2",
+]
+
+[project.optional-dependencies]
+rsp-remote = [
+    "pyvo>=1.5",
+    "lsst-daf-butler",
+]
+dev = [
+    "pytest>=7.4",
+]
+
+[project.scripts]
+dp2-mask = "dp2_skykatana_mask.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

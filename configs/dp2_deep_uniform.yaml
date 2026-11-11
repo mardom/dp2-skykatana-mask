@@ -1,0 +1,85 @@
+# Strict 6-band uniform cosmology / LSS mask preset for DP2 (all ugrizy required, seeing < 1.25").
+
+butler:
+  repo: "dp2"
+  collections: ["dp2"]
+
+region:
+  mode: "full"
+
+property_maps:
+  enabled: true
+  skymap: "lsst_cells_v2"
+  order_sparse: 15
+  order_cov: 5
+  bands: ["u", "g", "r", "i", "z", "y"]
+  min_filters: 6
+  required_bands: ["u", "g", "r", "i", "z", "y"]
+  keep_per_band_stages: false
+  per_band:
+    u:
+      min_exposures: 4
+      min_maglim: 24.0
+    g:
+      min_exposures: 6
+      min_maglim: 25.0
+      max_psf_fwhm_arcsec: 1.30
+    r:
+      min_exposures: 8
+      min_maglim: 24.8
+      max_psf_fwhm_arcsec: 1.20
+    i:
+      min_exposures: 8
+      min_maglim: 24.4
+      max_psf_fwhm_arcsec: 1.20
+    z:
+      min_exposures: 6
+      min_maglim: 23.7
+      max_psf_fwhm_arcsec: 1.25
+    y:
+      min_exposures: 4
+      min_maglim: 22.5
+
+monster_stars:
+  enabled: true
+  dataset_type: "auto"
+  order_sparse: 15
+  reference_bands: ["g", "r", "i", "z"]
+  mag_min: -5.0
+  mag_max: 18.5
+  radius_model: "exponential"
+  A_arcsec: 1350.0
+  B_per_mag: -0.24
+  mag_knee: 18.5
+  floor_arcsec: 8.0
+  min_radius_arcsec: 6.0
+  max_radius_arcsec: 720.0
+  enable_bleed_boxes: true
+  bleed_mag_max: 12.0
+
+galactic_mask:
+  enabled: true
+  order_sparse: 10
+  b0_deg: 20.0
+  bulge_a_deg: 25.0
+  bulge_b_deg: 20.0
+
+memory:
+  max_ram_gib: 32.0
+  cov_batch_size: 48
+  circle_chunk_size: 100000
+  skykatana_threads: 2
+
+output:
+  output_dir: "outputs/dp2_deep_uniform"
+  overwrite: true
+  order_out: 15
+  order_cov: 5
+  write_skykatana_pipe: true
+  write_healsparse_fits: true
+  write_moc_fits: true
+  moc_max_order: 13
+  write_fracdet_map: true
+  fracdet_order: 10
+  n_random_points: 500000
+  make_qa_plots: true

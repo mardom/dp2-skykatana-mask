@@ -1,0 +1,93 @@
+# Fast pilot configuration centered on ECDFS (~7 deg^2) for quick RSP validation (~30-60s).
+# Run on RSP:
+#   dp2-mask build --config configs/dp2_ecdfs_pilot.yaml
+
+butler:
+  repo: "dp2"
+  collections: ["dp2"]
+
+region:
+  mode: "cone"
+  ra_deg: 53.1222
+  dec_deg: -28.0870
+  radius_deg: 1.5
+
+property_maps:
+  enabled: true
+  skymap: "lsst_cells_v2"
+  order_sparse: 15           # Native NSIDE=32768 (~6.44 arcsec/pixel)
+  order_cov: 5               # Native NSIDE=32
+  bands: ["u", "g", "r", "i", "z", "y"]
+  min_filters: 4             # At least 4 of 6 LSST bands must pass at each pixel
+  required_bands: ["r", "i"] # r and i are mandatory
+  keep_per_band_stages: true # Small region -> safe to keep prop_{band}_mask stages for inspection
+  per_band:
+    u:
+      min_exposures: 2
+      nominal_exptime_sec: 30.0
+      min_maglim: 23.8
+    g:
+      min_exposures: 3
+      nominal_exptime_sec: 30.0
+      min_maglim: 24.8
+    r:
+      min_exposures: 4
+      nominal_exptime_sec: 30.0
+      min_maglim: 24.6
+      max_psf_fwhm_arcsec: 1.40
+    i:
+      min_exposures: 4
+      nominal_exptime_sec: 30.0
+      min_maglim: 24.2
+      max_psf_fwhm_arcsec: 1.40
+    z:
+      min_exposures: 3
+      nominal_exptime_sec: 30.0
+      min_maglim: 23.5
+    y:
+      min_exposures: 2
+      nominal_exptime_sec: 30.0
+      min_maglim: 22.3
+
+monster_stars:
+  enabled: true
+  dataset_type: "auto"       # Auto-resolves latest `the_monster_*` (e.g. `the_monster_20250219`)
+  order_sparse: 15
+  reference_bands: ["g", "r", "i", "z"]
+  mag_min: -5.0
+  mag_max: 18.0
+  radius_model: "exponential" # R(m) = A_arcsec * exp(B_per_mag * m)
+  A_arcsec: 1222.8
+  B_per_mag: -0.24
+  mag_knee: 18.0
+  floor_arcsec: 8.0
+  min_radius_arcsec: 5.0
+  max_radius_arcsec: 600.0
+  enable_bleed_boxes: true
+  bleed_mag_max: 11.5
+  bleed_width_factor: 0.25
+  bleed_height_factor: 2.5
+  save_star_circles_parquet: true
+
+galactic_mask:
+  enabled: false
+
+memory:
+  max_ram_gib: 32.0
+  cov_batch_size: 32
+  circle_chunk_size: 100000
+  skykatana_threads: 2
+
+output:
+  output_dir: "outputs/dp2_ecdfs_pilot"
+  overwrite: true
+  order_out: 15
+  order_cov: 5
+  write_skykatana_pipe: true
+  write_healsparse_fits: true
+  write_moc_fits: true
+  moc_max_order: 14
+  write_fracdet_map: true
+  fracdet_order: 10
+  n_random_points: 100000
+  make_qa_plots: true

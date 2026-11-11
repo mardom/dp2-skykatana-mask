@@ -1,0 +1,36 @@
+# Byte-compiled / caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Packaging / virtual environments
+build/
+dist/
+*.egg-info/
+.venv/
+venv/
+
+# Mask outputs & large astronomical artifacts
+outputs/
+*.hs
+*.hsp
+*.fits
+*.fit
+*.parquet
+*.feather
+*.hdf5
+*.h5
+dask-worker-space/
+skymaskpipe_write_*/
+
+# Credentials / tokens (NEVER commit RSP tokens!)
+*.token
+.rsp-tap.token
+.access_token
+.env
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
