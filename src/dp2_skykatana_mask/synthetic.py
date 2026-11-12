@@ -71,6 +71,7 @@ class SyntheticDP2Butler:
         "deepCoadd_sky_noise_consolidated_map_weighted_mean",
         "deepCoadd_sky_background_consolidated_map_weighted_mean",
     )
+    EBV_DATASET = "ebv_sfd98_consolidated_map"
     MONSTER_DATASET = "the_monster_20250219"
 
     def __init__(
@@ -82,6 +83,7 @@ class SyntheticDP2Butler:
         nside_sparse: int = 4096,  # order=12 for fast unit tests, or 16384/32768 for demos
         n_stars: int = 180,
         seed: int = 12345,
+        include_dust_filament: bool = True,
     ) -> None:
         self.collections = ["dp2"]
         self.center_ra_deg = float(center_ra_deg)
@@ -89,7 +91,9 @@ class SyntheticDP2Butler:
         self.radius_deg = float(radius_deg)
         self.nside_cov = int(nside_cov)
         self.nside_sparse = int(nside_sparse)
+        self.include_dust_filament = bool(include_dust_filament)
         self._maps: dict[tuple[str, str], hsp.HealSparseMap] = {}
+        self._ebv_map: hsp.HealSparseMap | None = None
         self._monster_shards: dict[int, MockSimpleCatalog] = {}
 
         self._populate_sp_maps(seed=seed)
@@ -113,6 +117,23 @@ class SyntheticDP2Butler:
         dra = (ra - self.center_ra_deg) * math.cos(math.radians(self.center_dec_deg))
         ddec = dec - self.center_dec_deg
         radial_frac = np.hypot(dra, ddec) / max(1e-6, self.radius_deg)
+
+        # Populate synthetic SFD98 E(B-V) map: low extragalactic floor (~0.018 mag) plus a
+        # realistic Galactic cirrus cloud + gradient reaching E(B-V) ~ 0.28 mag in NE quadrant
+        ebv_vals = np.full(all_pix.size, 0.018, dtype=np.float64)
+        if self.include_dust_filament:
+            x_norm = dra / max(1e-6, self.radius_deg)
+            y_norm = ddec / max(1e-6, self.radius_deg)
+            cloud = 0.24 * np.exp(
+                -(((x_norm - 0.42) / 0.28) ** 2 + ((y_norm - 0.35) / 0.22) ** 2)
+            )
+            gradient = 0.045 * np.clip(0.5 * (x_norm + y_norm) + 0.5, 0.0, 1.5)
+            ebv_vals = ebv_vals + cloud + gradient
+        ebv_map = hsp.HealSparseMap.make_empty(
+            self.nside_cov, self.nside_sparse, dtype=np.float32
+        )
+        ebv_map.update_values_pix(all_pix, ebv_vals.astype(np.float32))
+        self._ebv_map = ebv_map
 
         for b_idx, band in enumerate(bands):
             # Vary coverage slightly by band so multi-band K-of-N (`min_filters`) is exercised!
@@ -191,7 +212,7 @@ class SyntheticDP2Butler:
             self._monster_shards[htm_id] = MockSimpleCatalog(cols)
 
     def query_dataset_types(self, pattern: str = "*") -> list[_MockDatasetType]:
-        all_names = [*self.CONSOLIDATED_MAPS, self.MONSTER_DATASET]
+        all_names = [*self.CONSOLIDATED_MAPS, self.EBV_DATASET, self.MONSTER_DATASET]
         return [_MockDatasetType(n) for n in all_names if fnmatch.fnmatch(n, pattern)]
 
     def query_datasets(
@@ -233,11 +254,18 @@ class SyntheticDP2Butler:
         ds_name = str(dataset_or_ref)
         if ds_name.endswith(".coverage"):
             base_ds = ds_name[: -len(".coverage")]
+            if base_ds == self.EBV_DATASET:
+                assert self._ebv_map is not None
+                return self._ebv_map._cov_map
             assert band is not None
             return self._maps[(base_ds, band)]._cov_map
 
-        assert band is not None
-        full_map = self._maps[(ds_name, band)]
+        if ds_name == self.EBV_DATASET:
+            assert self._ebv_map is not None
+            full_map = self._ebv_map
+        else:
+            assert band is not None
+            full_map = self._maps[(ds_name, band)]
         if not parameters:
             return full_map
 

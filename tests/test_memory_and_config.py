@@ -1,4 +1,4 @@
-"""Unit tests for YAML configurations, 32 GiB RSP memory guards, and Monster star math."""
+"""Unit tests for YAML configurations, 32 GiB RSP memory guards, Tutorial 311.1 dust math, and SkyKatana radfunction."""
 
 from __future__ import annotations
 
@@ -10,12 +10,19 @@ from pathlib import Path
 from unittest import mock
 
 import numpy as np
+import pandas as pd
 
 from dp2_skykatana_mask import (
     BandCriteria,
+    DEFAULT_RUBIN_RX_RV31,
     DP2MaskBuilder,
     MonsterStarConfig,
+    compute_band_extinction_mag,
+    deredden_magnitude,
+    get_rubin_band_extinction_rx,
     load_config,
+    make_skykatana_radfunction,
+    skykatana_lsst_radfunction,
 )
 from dp2_skykatana_mask.butler_io import resolve_monster_flux_columns
 from dp2_skykatana_mask.memory import (
@@ -41,6 +48,8 @@ class TestConfigAndMemory(unittest.TestCase):
 
         for yf in yaml_files:
             cfg = load_config(yf)
+            self.assertTrue(cfg.dust.enabled)
+            self.assertEqual(cfg.monster_stars.radius_model, "skykatana_rubin")
             builder = DP2MaskBuilder(cfg)
             est = builder.estimate_memory(assumed_area_deg2=6500.0)
             self.assertLess(
@@ -73,7 +82,68 @@ class TestConfigAndMemory(unittest.TestCase):
         # 1.17741" / 2.35482 = 0.5" sigma -> 0.5" / 0.2"/pix = 2.5 pixels
         self.assertAlmostEqual(crit.effective_max_psf_pixels() or 0.0, 2.5, places=4)
 
-    def test_flux_njy_to_abmag_and_radii(self) -> None:
+    def test_tutorial_311_1_rubin_dust_extinction(self) -> None:
+        rx = get_rubin_band_extinction_rx(r_v=3.1)
+        for band, expected in DEFAULT_RUBIN_RX_RV31.items():
+            # rubin_sim.phot_utils.DustValues (when installed) uses live SysEng throughputs (~4.76 in u)
+            self.assertAlmostEqual(rx[band], expected, delta=0.10)
+
+        # Monotonic wavelength dependence: R_u > R_g > R_r > R_i > R_z > R_y
+        ordered = [rx[b] for b in ("u", "g", "r", "i", "z", "y")]
+        self.assertEqual(ordered, sorted(ordered, reverse=True))
+
+        # Verify A_b = R_b * E(B-V) and m_dered = m_obs - A_b
+        ebv = np.array([0.0, 0.10, 0.25])
+        a_g = compute_band_extinction_mag(ebv, band="g", rx_map=DEFAULT_RUBIN_RX_RV31)
+        np.testing.assert_allclose(a_g, np.array([0.0, 0.364, 0.910]), rtol=1e-4)
+
+        m_obs = np.array([25.0, 25.0, 25.0])
+        m_dered = deredden_magnitude(m_obs, ebv, band="g", rx_map=DEFAULT_RUBIN_RX_RV31)
+        np.testing.assert_allclose(m_dered, np.array([25.0, 24.636, 24.090]), rtol=1e-4)
+
+    def test_skykatana_lsst_radfunction_and_models(self) -> None:
+        df = pd.DataFrame(
+            {
+                "mag": [5.0, 10.0, 14.0, 17.5],
+                "lsst_g_mag": [5.4, 10.3, 14.2, 17.8],
+                "lsst_r_mag": [5.0, 10.0, 14.0, 17.5],
+                "lsst_i_mag": [4.6, 9.7, 13.8, 17.2],
+            }
+        )
+        out_r85 = skykatana_lsst_radfunction(
+            df.copy(), band="r", completeness=0.85, min_radius_arcsec=0.0, max_radius_arcsec=3600.0
+        )
+        self.assertIn("radius", out_r85.columns)
+        r_deg = out_r85["radius"].to_numpy()
+        # Strictly decreasing with fainter LSST magnitude
+        self.assertTrue(np.all(np.diff(r_deg) < 0.0))
+        # Exact Rubin r-band 85% completeness calibration at m_LSST = 10.0 (converted to degrees)
+        expected_deg_m10 = (1068.4259556870957 * math.exp(-0.23979264155393915 * 10.0)) / 3600.0
+        self.assertAlmostEqual(float(r_deg[1]), expected_deg_m10, places=6)
+
+        # Completeness monotonicity: R(c=0.90) > R(c=0.85) > R(c=0.80)
+        out_r90 = skykatana_lsst_radfunction(df.copy(), band="r", completeness=0.90, min_radius_arcsec=0.0)
+        out_r80 = skykatana_lsst_radfunction(df.copy(), band="r", completeness=0.80, min_radius_arcsec=0.0)
+        self.assertTrue(np.all(out_r90["radius"].to_numpy() > out_r85["radius"].to_numpy()))
+        self.assertTrue(np.all(out_r85["radius"].to_numpy() > out_r80["radius"].to_numpy()))
+
+        # 3-piece scattered-light r_halo gives wider halo at m_r=5.0 than single-exponential core
+        out_halo = skykatana_lsst_radfunction(df.copy(), band="r_halo", completeness=0.85, min_radius_arcsec=0.0)
+        self.assertGreater(float(out_halo["radius"].iloc[0]), float(out_r85["radius"].iloc[0]))
+
+        # Multi-band envelope >= single r-band radius
+        ms_multi = MonsterStarConfig(
+            radius_model="skykatana_rubin",
+            profile_band="multi",
+            completeness=0.85,
+            min_radius_arcsec=0.0,
+            max_radius_arcsec=3600.0,
+        )
+        radfn_multi = make_skykatana_radfunction(ms_multi)
+        out_multi = radfn_multi(df.copy())
+        self.assertTrue(np.all(out_multi["radius"].to_numpy() >= out_r85["radius"].to_numpy() - 1e-9))
+
+    def test_flux_njy_to_abmag_and_legacy_radii(self) -> None:
         # Exact Oke & Gunn AB zero-point flux: 10**(31.4/2.5) nJy ~= 3.6307805e12 nJy -> AB mag = 0.0
         zero_mag_njy = 10.0 ** (AB_MAG_ZEROPOINT_NJY / 2.5)
         mags = flux_njy_to_abmag(np.array([zero_mag_njy, 3.631e12, 1.0, 0.0, -5.0]))

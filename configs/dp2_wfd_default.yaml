@@ -55,6 +55,16 @@ property_maps:
       exposure_subpixel_tol: 0.05
       min_maglim: 22.1
 
+# DP2 Tutorial 311.1 Milky Way dust de-reddening + nominal WFD extragalactic ceiling E(B-V) <= 0.12
+dust:
+  enabled: true
+  apply_to_maglim: true
+  r_v: 3.1
+  ebv_source: "auto"
+  max_ebv: 0.12
+  min_galactic_lat_deg: 5.0
+  order_sparse: 11
+
 monster_stars:
   enabled: true
   dataset_type: "auto"
@@ -62,11 +72,10 @@ monster_stars:
   reference_bands: ["g", "r", "i", "z"]
   mag_min: -5.0
   mag_max: 18.0
-  radius_model: "exponential"
-  A_arcsec: 1222.8
-  B_per_mag: -0.24
-  mag_knee: 18.0
-  floor_arcsec: 8.0
+  radius_model: "skykatana_rubin"
+  profile_band: "r"
+  completeness: 0.85
+  use_faint_floor: false
   min_radius_arcsec: 5.0
   max_radius_arcsec: 600.0
   enable_bleed_boxes: false

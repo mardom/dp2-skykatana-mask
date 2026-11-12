@@ -29,6 +29,12 @@ from skykatana import SkyMaskPipe
 
 from .butler_io import open_dp2_butler
 from .config import MaskPipelineConfig
+from .dust import (
+    DustMaskStats,
+    EBVProvider,
+    build_dust_extinction_mask,
+    get_rubin_band_extinction_rx,
+)
 from .memory import (
     MemoryGuard,
     configure_rsp_thread_env,
@@ -53,6 +59,7 @@ class MaskBuildSummary:
     order_cov: int
     nside_out: int
     property_mask: PropertyMaskStats
+    dust_mask: DustMaskStats | None
     monster_stars: MonsterStarMaskStats | None
     mwmask_area_deg2: float
     positive_stages: list[str]
@@ -118,7 +125,16 @@ class DP2MaskBuilder:
 
         butler = self._butler if self._butler is not None else open_dp2_butler(self.cfg)
 
-        # Stage 1: DP2 Survey Property Maps (`sp_maps`)
+        ebv_provider: EBVProvider | None = None
+        rx_map: dict[str, float] | None = None
+        if self.cfg.dust.enabled:
+            ebv_provider = EBVProvider.from_config(self.cfg, butler=butler)
+            rx_map = get_rubin_band_extinction_rx(
+                r_v=self.cfg.dust.r_v,
+                overrides=self.cfg.dust.r_x_overrides,
+            )
+
+        # Stage 1: DP2 Survey Property Maps (`sp_maps`, with optional Tutorial 311.1 dust dereddening)
         logger.info("=== Stage 1: Building DP2 survey property map mask (propmask) ===")
         propmask, prop_stats = build_dp2_property_mask(
             self.pipe,
@@ -126,9 +142,27 @@ class DP2MaskBuilder:
             cfg=self.cfg,
             guard=self.guard,
             output_stage="propmask",
+            ebv_provider=ebv_provider,
+            rx_map=rx_map,
         )
         positive_stages = ["propmask"]
         negative_stages: list[str] = []
+
+        # Stage 1b: Foreground Milky Way dust extinction ceiling (`dustmask`, Tutorial 311.1)
+        dust_stats: DustMaskStats | None = None
+        if self.cfg.dust.enabled and ebv_provider is not None:
+            logger.info("=== Stage 1b: Evaluating Milky Way E(B-V) dust mask (dustmask) ===")
+            dust_map, dust_stats = build_dust_extinction_mask(
+                self.pipe,
+                footprint_mask=propmask,
+                cfg=self.cfg,
+                ebv_provider=ebv_provider,
+                guard=self.guard,
+                rx_map=rx_map,
+                output_stage="dustmask",
+            )
+            if dust_map is not None and dust_stats.dustmask_valid_pixels > 0:
+                negative_stages.append("dustmask")
 
         # Stage 2: Bright stars from `the_monster`
         star_stats: MonsterStarMaskStats | None = None
@@ -204,6 +238,7 @@ class DP2MaskBuilder:
             order_cov=int(self.cfg.output.order_cov),
             nside_out=1 << int(self.cfg.output.order_out),
             property_mask=prop_stats,
+            dust_mask=dust_stats,
             monster_stars=star_stats,
             mwmask_area_deg2=mwmask_area_deg2,
             positive_stages=positive_stages,
@@ -252,10 +287,15 @@ class DP2MaskBuilder:
             files["combined_healsparse_hs"] = str(hs_path)
 
         if out_cfg.write_moc_fits and self.pipe.mask is not None and int(self.pipe.mask.n_valid) > 0:
+            eff_moc_order = (
+                min(int(out_cfg.moc_max_order), int(out_cfg.order_out))
+                if out_cfg.moc_max_order is not None
+                else int(out_cfg.order_out)
+            )
             moc_path = out_dir / "dp2_combined_mask_moc.fits"
             moc = SkyMaskPipe.moc_from_stage(
                 self.pipe.mask,
-                order_forced=out_cfg.moc_max_order,
+                order_forced=eff_moc_order,
                 progress=False,
             )
             moc.save(str(moc_path), format="fits", overwrite=bool(out_cfg.overwrite))
@@ -311,14 +351,20 @@ def _render_qa_plot(pipe: SkyMaskPipe, summary: MaskBuildSummary, out_path: Path
     areas.append(summary.property_mask.area_deg2)
     colors.append("#2B5C8F")
 
-    labels.append("final mask\n(-stars/MW)")
+    if summary.dust_mask is not None and summary.dust_mask.dustmask_area_deg2 > 0:
+        labels.append("dustmask\n(excluded)")
+        areas.append(summary.dust_mask.dustmask_area_deg2)
+        colors.append("#E45756")
+
+    labels.append("final mask\n(-dust/stars/MW)")
     areas.append(summary.final_area_deg2)
     colors.append("#54A24B")
 
     bars = ax0.bar(labels, areas, color=colors, edgecolor="black", linewidth=0.6)
     ax0.set_ylabel("Valid Sky Area [deg$^2$]")
+    dust_tag = " [dust-dereddened]" if summary.property_mask.dust_dereddened_maglim else ""
     ax0.set_title(
-        f"DP2 Footprint Stage Waterfall (min_filters={summary.property_mask.min_filters})"
+        f"DP2 Footprint Stage Waterfall (min_filters={summary.property_mask.min_filters}){dust_tag}"
     )
     ax0.tick_params(axis="x", rotation=28)
     for bar, val in zip(bars, areas):

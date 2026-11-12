@@ -49,6 +49,17 @@ property_maps:
       nominal_exptime_sec: 30.0
       min_maglim: 22.3
 
+# DP2 Tutorial 311.1 Milky Way Dust Extinction Correction:
+# De-reddens per-pixel 5-sigma `psf_maglim` via A_b = r_x[b] * E(B-V) (DustValues R_V=3.1)
+# and builds a negative `dustmask` stage excluding high-extinction pixels (E(B-V) > max_ebv).
+dust:
+  enabled: true
+  apply_to_maglim: true
+  r_v: 3.1
+  ebv_source: "auto"
+  max_ebv: 0.20
+  order_sparse: 11
+
 monster_stars:
   enabled: true
   dataset_type: "auto"       # Auto-resolves latest `the_monster_*` (e.g. `the_monster_20250219`)
@@ -56,11 +67,10 @@ monster_stars:
   reference_bands: ["g", "r", "i", "z"]
   mag_min: -5.0
   mag_max: 18.0
-  radius_model: "exponential" # R(m) = A_arcsec * exp(B_per_mag * m)
-  A_arcsec: 1222.8
-  B_per_mag: -0.24
-  mag_knee: 18.0
-  floor_arcsec: 8.0
+  radius_model: "skykatana_rubin" # Native SkyKatana `radfunction(df, **kwargs)` vs LSST mag
+  profile_band: "r"
+  completeness: 0.85
+  use_faint_floor: false
   min_radius_arcsec: 5.0
   max_radius_arcsec: 600.0
   enable_bleed_boxes: true

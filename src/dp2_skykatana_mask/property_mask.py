@@ -16,8 +16,8 @@ from __future__ import annotations
 import gc
 import logging
 import math
-from dataclasses import dataclass
-from typing import Any, Sequence
+from dataclasses import dataclass, field
+from typing import Any, Mapping, Sequence
 
 import healsparse as hsp
 import hpgeom as hpg
@@ -26,6 +26,7 @@ from skykatana import SkyMaskPipe
 
 from .butler_io import get_sp_map_chunk, get_sp_map_coverage, list_consolidated_maps
 from .config import BandCriteria, MaskPipelineConfig, RegionSelector
+from .dust import EBVProvider, get_rubin_band_extinction_rx
 from .memory import MemoryGuard
 
 logger = logging.getLogger(__name__)
@@ -53,6 +54,9 @@ class PropertyMaskStats:
     n_valid_pixels: int
     area_deg2: float
     per_band_area_deg2: dict[str, float]
+    dust_dereddened_maglim: bool = False
+    ebv_source_used: str | None = None
+    dust_rx_by_band: dict[str, float] = field(default_factory=dict)
 
 
 def _angular_separation_deg(
@@ -189,13 +193,43 @@ def build_dp2_property_mask(
     cfg: MaskPipelineConfig,
     guard: MemoryGuard,
     output_stage: str = "propmask",
+    ebv_provider: EBVProvider | None = None,
+    rx_map: Mapping[str, float] | None = None,
 ) -> tuple[hsp.HealSparseMap, PropertyMaskStats]:
-    """Stream DP2 consolidated property maps from Butler into a bit-packed ``SkyMaskPipe`` stage."""
+    """Stream DP2 consolidated property maps from Butler into a bit-packed ``SkyMaskPipe`` stage.
+
+    When ``cfg.dust.enabled`` and ``cfg.dust.apply_to_maglim`` are True, per-pixel
+    $5\\sigma$ limiting magnitudes (``psf_maglim``) are corrected for foreground Milky Way
+    dust extinction ($m_{b,\\mathrm{lim}}^{\\mathrm{dered}} = m_{b,\\mathrm{lim}}^{\\mathrm{obs}} -
+    R_b E(B-V)$, DP2 Tutorial 311.1) before applying ``min_maglim`` / ``max_maglim``.
+    """
     pm_cfg = cfg.property_maps
     bands = list(pm_cfg.bands)
     required_set = set(pm_cfg.required_bands)
     order_sparse = int(pm_cfg.order_sparse)
     nside_sparse = 1 << order_sparse
+
+    apply_dust_maglim = bool(cfg.dust.enabled and cfg.dust.apply_to_maglim)
+    rx_used: dict[str, float] = {}
+    active_ebv_provider: EBVProvider | None = None
+    if apply_dust_maglim:
+        rx_used = (
+            dict(rx_map)
+            if rx_map is not None
+            else get_rubin_band_extinction_rx(r_v=cfg.dust.r_v, overrides=cfg.dust.r_x_overrides)
+        )
+        active_ebv_provider = (
+            ebv_provider
+            if ebv_provider is not None
+            else EBVProvider.from_config(cfg, butler=butler)
+        )
+        logger.info(
+            "Applying Milky Way dust extinction correction to %s (source=%s, R_V=%.2f, r_x=%s)",
+            pm_cfg.maglim_dataset,
+            active_ebv_provider.source_name,
+            cfg.dust.r_v,
+            {b: rx_used[b] for b in bands if b in rx_used},
+        )
 
     band_conditions = {b: _conditions_for_band(cfg, b) for b in bands}
     needed_datasets = {ds for conds in band_conditions.values() for (ds, _, _, _) in conds}
@@ -343,6 +377,17 @@ def build_dp2_property_mask(
                     valid_val = np.isfinite(vals)
                     if require_pos:
                         valid_val &= vals > 0.0
+
+                    if (
+                        apply_dust_maglim
+                        and active_ebv_provider is not None
+                        and ds_name == pm_cfg.maglim_dataset
+                        and np.any(valid_val)
+                    ):
+                        ebv_vals = active_ebv_provider.eval_nest_pixels(nside_sparse, vpix)
+                        vals = vals - float(rx_used[band]) * ebv_vals
+                        del ebv_vals
+
                     keep = valid_val & op_fn(vals, thresh)
                     sel_pix = vpix[keep]
                     del vpix, vals, valid_val, keep
@@ -446,11 +491,17 @@ def build_dp2_property_mask(
             "Relax `min_exposures`, `min_filters`, or `min_maglim` in your configuration."
         )
 
+    rx_summary = {b: round(float(rx_used[b]), 4) for b in bands if b in rx_used}
+    ebv_src_name = active_ebv_provider.source_name if active_ebv_provider is not None else None
+
     extra_meta = {
         "skymap": pm_cfg.skymap,
         "bands": bands,
         "min_filters": pm_cfg.min_filters,
         "required_bands": list(pm_cfg.required_bands),
+        "dust_dereddened_maglim": apply_dust_maglim,
+        "ebv_source_used": ebv_src_name,
+        "dust_rx_by_band": rx_summary,
         "pixels": n_valid,
         "area_deg2": area_deg2,
         "per_band_area_deg2": per_band_area,
@@ -472,6 +523,9 @@ def build_dp2_property_mask(
         n_valid_pixels=n_valid,
         area_deg2=area_deg2,
         per_band_area_deg2=per_band_area,
+        dust_dereddened_maglim=apply_dust_maglim,
+        ebv_source_used=ebv_src_name,
+        dust_rx_by_band=rx_summary,
     )
     return propmask, stats
 

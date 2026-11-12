@@ -40,6 +40,16 @@ property_maps:
       min_exposures: 4
       min_maglim: 22.5
 
+# Strict DESC / cosmology dust cut: Tutorial 311.1 de-reddened depth + E(B-V) <= 0.08
+dust:
+  enabled: true
+  apply_to_maglim: true
+  r_v: 3.1
+  ebv_source: "auto"
+  max_ebv: 0.08
+  min_galactic_lat_deg: 10.0
+  order_sparse: 11
+
 monster_stars:
   enabled: true
   dataset_type: "auto"
@@ -47,11 +57,10 @@ monster_stars:
   reference_bands: ["g", "r", "i", "z"]
   mag_min: -5.0
   mag_max: 18.5
-  radius_model: "exponential"
-  A_arcsec: 1350.0
-  B_per_mag: -0.24
-  mag_knee: 18.5
-  floor_arcsec: 8.0
+  radius_model: "skykatana_rubin"
+  profile_band: "r_halo"     # 3-piece extended scattered-light + diffraction halo + core profile
+  completeness: 0.90
+  use_faint_floor: true
   min_radius_arcsec: 6.0
   max_radius_arcsec: 720.0
   enable_bleed_boxes: true

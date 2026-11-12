@@ -148,6 +148,62 @@ class PropertyMapsConfig:
 
 
 @dataclass
+class DustExtinctionConfig:
+    """Milky Way foreground dust extinction correction & masking (DP2 Tutorial 311.1).
+
+    Uses ``rubin_sim.phot_utils.DustValues(r_v=...).r_x`` ($R_b = A_b / E(B-V)$) and
+    SFD98 $E(B-V)$ maps to:
+      1. De-redden per-pixel $5\\sigma$ ``psf_maglim`` values ($m_{\\mathrm{lim}}^{\\mathrm{dered}} =
+         m_{\\mathrm{lim}}^{\\mathrm{obs}} - R_b E(B-V)$) when ``apply_to_maglim=True``, and
+      2. Build a negative ``dustmask`` stage excluding pixels with $E(B-V) > \\text{max\\_ebv}$
+         (or $|b| < \\text{min\\_galactic\\_lat\\_deg}$).
+    """
+
+    enabled: bool = True
+    apply_to_maglim: bool = True
+    r_v: float = 3.1
+    r_x_overrides: dict[str, float] = field(default_factory=dict)
+    # "auto", "butler", "rubin_sim_sfd", "healsparse_file", "healpix_file",
+    # "dustmaps_sfd", "tap_object", or "analytic_galactic"
+    ebv_source: str = "auto"
+    ebv_dataset: str = "ebv_sfd98_consolidated_map"
+    ebv_map_path: str | None = None
+    # Nominal extragalactic E(B-V) ceiling (e.g. 0.20 general, 0.12 WFD nominal, 0.08 strict DESC)
+    max_ebv: float | None = 0.20
+    # Optional SFD98 reliability guard for low Galactic latitudes (Tutorial 311.1 warns |b| < 5 deg)
+    min_galactic_lat_deg: float | None = None
+    order_sparse: int = 11  # NSIDE=2048 (~1.7 arcmin, finer than SFD98 6.1 arcmin FWHM)
+
+    def validate(self) -> None:
+        if not self.enabled:
+            return
+        if self.r_v <= 0:
+            raise ValueError(f"dust.r_v must be > 0, got {self.r_v}")
+        valid_sources = (
+            "auto",
+            "butler",
+            "rubin_sim_sfd",
+            "rubin_scheduler",
+            "healsparse_file",
+            "healpix_file",
+            "npz_file",
+            "dustmaps_sfd",
+            "tap_object",
+            "analytic_galactic",
+        )
+        if self.ebv_source not in valid_sources:
+            raise ValueError(
+                f"dust.ebv_source must be one of {valid_sources}, got {self.ebv_source!r}"
+            )
+        if self.max_ebv is not None and self.max_ebv <= 0:
+            raise ValueError(f"dust.max_ebv must be > 0 when set, got {self.max_ebv}")
+        if self.min_galactic_lat_deg is not None and not (0.0 <= self.min_galactic_lat_deg <= 90.0):
+            raise ValueError("dust.min_galactic_lat_deg must lie in [0, 90]")
+        if not (5 <= self.order_sparse <= 15):
+            raise ValueError(f"dust.order_sparse must lie in [5, 15], got {self.order_sparse}")
+
+
+@dataclass
 class MonsterStarConfig:
     """Configuration for Stage 2: Bright-star masking from `the_monster` catalog."""
 
@@ -156,23 +212,31 @@ class MonsterStarConfig:
     dataset_type: str = "auto"
     collections: list[str] | None = None
     order_sparse: int = 15  # NSIDE=32768 (~6.4") for crisp star halos
-    # Band(s) used to compute synthetic AB magnitude from `monster_*_{band}_flux` (nJy).
-    # If multiple bands are listed, the brightest (minimum) valid AB mag across them is used!
+    # Band(s) used to compute synthetic LSST AB magnitude from `monster_*_{band}_flux` (nJy).
+    # Note: Bright-star diffraction/ghost halos depend on *observed* apparent flux on LSSTCam
+    # (not dust-dereddened intrinsic stellar luminosity).
     reference_bands: list[str] = field(default_factory=lambda: ["g", "r", "i", "z"])
     # Optional explicit flux column override (e.g. "monster_ComCam_r_flux" or "phot_g_mean_flux")
     explicit_flux_column: str | None = None
     mag_min: float = -5.0
-    mag_max: float = 18.0  # Faintest Monster star magnitude to mask
+    mag_max: float = 18.0  # Faintest Monster LSST star magnitude to mask
 
     # Radius scaling model:
-    # - "exponential": R(m) = A_arcsec * exp(B_per_mag * m) for m <= mag_knee, else floor_arcsec
-    #                  (Note: B_per_mag < 0, e.g. -0.24, matching clopez DP1/DP2 profile fits!)
-    # - "powerlaw10":  R(m) = r0_arcsec * 10**(slope_dex_per_mag * (m0 - m))
-    # - "csv_fit":     Load A_arcsec, B_per_mag from clopez `radius_magnitude_fit_coefficients.csv`
-    radius_model: str = "exponential"
-    A_arcsec: float = 1222.8
-    B_per_mag: float = -0.24
-    mag_knee: float = 18.0
+    # - "skykatana_rubin": Native SkyKatana `radfunction(df, **kwargs)` empirical Rubin profile
+    #                      fits as a function of LSST magnitude (`profile_band`, `completeness`)
+    # - "exponential":     Custom R(m) = A_arcsec * exp(B_per_mag * m)
+    # - "powerlaw10":      Custom R(m) = r0_arcsec * 10**(slope_dex_per_mag * (m0 - m))
+    # - "csv_fit":         Load A_arcsec, B_per_mag from `radius_magnitude_fit_coefficients.csv`
+    radius_model: str = "skykatana_rubin"
+    # SkyKatana Rubin profile band: "u", "g", "r", "i", "z", "y", "r_halo" (3-piece wing+core),
+    # or "multi" (envelope across `reference_bands`)
+    profile_band: str = "r"
+    completeness: float = 0.85  # SkyKatana completeness target (e.g. 0.80, 0.85, 0.90)
+    use_faint_floor: bool = False  # Apply SkyKatana faint-star plateau above knee magnitude
+
+    A_arcsec: float = 1068.426
+    B_per_mag: float = -0.2398
+    mag_knee: float | None = 18.0
     floor_arcsec: float = 8.0
     r0_arcsec: float = 150.0
     m0: float = 10.0
@@ -196,10 +260,21 @@ class MonsterStarConfig:
             return
         if not (8 <= self.order_sparse <= 16):
             raise ValueError(f"monster_stars.order_sparse must be in [8, 16], got {self.order_sparse}")
-        if self.radius_model not in ("exponential", "powerlaw10", "csv_fit"):
+        valid_models = ("skykatana_rubin", "exponential", "powerlaw10", "csv_fit")
+        if self.radius_model not in valid_models:
             raise ValueError(
-                f"monster_stars.radius_model must be 'exponential', 'powerlaw10', or 'csv_fit', "
+                f"monster_stars.radius_model must be one of {valid_models}, "
                 f"got {self.radius_model!r}"
+            )
+        valid_prof_bands = (*VALID_LSST_BANDS, "r_halo", "multi")
+        if self.profile_band not in valid_prof_bands:
+            raise ValueError(
+                f"monster_stars.profile_band must be one of {valid_prof_bands}, "
+                f"got {self.profile_band!r}"
+            )
+        if not (0.50 <= float(self.completeness) < 1.0):
+            raise ValueError(
+                f"monster_stars.completeness must lie in [0.50, 1.0), got {self.completeness}"
             )
         if self.radius_model == "csv_fit" and not self.fit_coefficients_csv:
             raise ValueError("fit_coefficients_csv must be provided when radius_model='csv_fit'")
@@ -263,6 +338,7 @@ class MaskPipelineConfig:
     access_token_file: str | None = None  # Only needed when using RemoteButler outside RSP
     region: RegionSelector = field(default_factory=RegionSelector)
     property_maps: PropertyMapsConfig = field(default_factory=PropertyMapsConfig)
+    dust: DustExtinctionConfig = field(default_factory=DustExtinctionConfig)
     monster_stars: MonsterStarConfig = field(default_factory=MonsterStarConfig)
     galactic_mask: GalacticMaskConfig = field(default_factory=GalacticMaskConfig)
     memory: MemoryConfig = field(default_factory=MemoryConfig)
@@ -271,6 +347,7 @@ class MaskPipelineConfig:
     def validate(self) -> None:
         self.region.validate()
         self.property_maps.validate()
+        self.dust.validate()
         self.monster_stars.validate()
         if not self.property_maps.enabled:
             raise ValueError("property_maps.enabled must be True to define a positive survey footprint")
@@ -303,6 +380,7 @@ def load_config(path: str | Path) -> MaskPipelineConfig:
     per_band = {str(b): _parse_band_criteria(crit or {}) for b, crit in per_band_raw.items()}
     property_maps = PropertyMapsConfig(**pm_raw, per_band=per_band)
 
+    dust = DustExtinctionConfig(**(raw.get("dust") or {}))
     monster_stars = MonsterStarConfig(**(raw.get("monster_stars") or {}))
     galactic_mask = GalacticMaskConfig(**(raw.get("galactic_mask") or {}))
     memory = MemoryConfig(**(raw.get("memory") or {}))
@@ -323,6 +401,7 @@ def load_config(path: str | Path) -> MaskPipelineConfig:
         access_token_file=token_file,
         region=region,
         property_maps=property_maps,
+        dust=dust,
         monster_stars=monster_stars,
         galactic_mask=galactic_mask,
         memory=memory,

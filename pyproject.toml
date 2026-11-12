@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dp2-skykatana-mask"
-version = "0.1.0"
-description = "Memory-safe (32 GB RSP) DP2 survey property & Monster bright-star spatial masks built with SkyKatana"
+version = "0.2.0"
+description = "Memory-safe (32 GB RSP) DP2 survey property, Milky Way dust & Monster bright-star spatial masks built with SkyKatana"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
