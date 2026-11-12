@@ -1,6 +1,6 @@
 """Runtime safety patches for upstream SkyKatana on NumPy 2.x and 32 GiB RSP containers.
 
-Addresses two upstream issues in ``skykatana.skykatana``:
+Addresses three upstream issues in ``skykatana.skykatana``:
 1. ``_write_stage_fits_bitpack`` builds its variable-length ``PB()`` FITS column via
    ``np.array(batch_packed, dtype=object)``. Whenever a stage (such as ``dustmask`` or
    ``boxmask`` on a single-pointing pilot) occupies 1 coverage tile — or multiple coverage
@@ -12,6 +12,11 @@ Addresses two upstream issues in ``skykatana.skykatana``:
    Kubernetes host nodes, spawning 32 concurrent ``fitsio`` reader threads allocates
    ``32 * 96 MB = 3 GiB`` of scratch buffers and can trigger non-reentrant ``cfitsio`` races.
    Defaulting ``max_workers=1`` when unspecified keeps stage loading deterministic and <100 MB.
+3. ``SkyMaskPipe.plot_moc`` without ``clipra``/``clipdec`` calls ``stage.valid_pixels`` before
+   computing ``order_display = self.get_plot_order(wcs)``. On a full 6,500 deg² order-15 DP2
+   mask (~20 billion valid pixels), materializing ``stage.valid_pixels`` allocates ~160 GiB
+   before immediately coarsening to display order 6–8. Streaming via ``SkyMaskPipe.moc_from_stage``
+   produces the identical display MOC in <20 MB RAM.
 """
 
 from __future__ import annotations
@@ -20,7 +25,11 @@ import functools
 import os
 from typing import Any
 
+from astropy.coordinates import Angle
+import astropy.units as u
 import fitsio
+import matplotlib.pyplot as plt
+from mocpy import WCS
 import numpy as np
 import skykatana.skykatana as _sk_mod
 from skykatana import SkyMaskPipe
@@ -159,7 +168,7 @@ def _safe_write_stage_fits_bitpack(
 
 
 def apply_skykatana_runtime_fixes() -> None:
-    """Idempotently install ``fitsio`` VL-array and RSP thread-cap fixes on ``skykatana``."""
+    """Idempotently install ``fitsio`` VL-array, RSP thread-cap, and streaming ``plot_moc`` fixes."""
     global _PATCHED
     if _PATCHED:
         return
@@ -177,5 +186,118 @@ def apply_skykatana_runtime_fixes() -> None:
             return raw_read(cls, indir, *args, **kwargs)
 
         SkyMaskPipe.read = classmethod(_safe_read)  # type: ignore[method-assign]
+
+    orig_plot_moc = getattr(SkyMaskPipe, "plot_moc", None)
+    if callable(orig_plot_moc):
+
+        @functools.wraps(orig_plot_moc)
+        def _streaming_plot_moc(
+            self: SkyMaskPipe,
+            stage: Any,
+            center: Any = None,
+            fov: Any = None,
+            clipra: tuple[float, float] | None = None,
+            clipdec: tuple[float, float] | None = None,
+            order_force: int | None = None,
+            frame: str = "icrs",
+            projection: str = "SIN",
+            figsize: tuple[float, float] = (10.0, 5.0),
+            color: str = "green",
+            alpha: float = 0.2,
+            linewidth: float = 1.0,
+            label: str | None = None,
+            ax: Any = None,
+            wcs: Any = None,
+            show: bool = False,
+            stream_pars: dict[str, object] | None = None,
+        ) -> tuple[Any, Any, Any]:
+            if clipra is not None and clipdec is not None:
+                return orig_plot_moc(
+                    self,
+                    stage,
+                    center=center,
+                    fov=fov,
+                    clipra=clipra,
+                    clipdec=clipdec,
+                    order_force=order_force,
+                    frame=frame,
+                    projection=projection,
+                    figsize=figsize,
+                    color=color,
+                    alpha=alpha,
+                    linewidth=linewidth,
+                    label=label,
+                    ax=ax,
+                    wcs=wcs,
+                    show=show,
+                    stream_pars=stream_pars,
+                )
+
+            stage_map = stage if hasattr(stage, "valid_pixels") else getattr(self, stage)
+            if ax is None or wcs is None:
+                if center is None or fov is None:
+                    raise ValueError("When ax/wcs are not provided, you must pass center and fov.")
+                fig = plt.figure(figsize=figsize)
+                with WCS(
+                    fig,
+                    fov=fov,
+                    center=center,
+                    coordsys=frame,
+                    projection=projection,
+                    rotation=Angle(0, u.deg),
+                ) as _wcs:
+                    ax = fig.add_subplot(1, 1, 1, projection=_wcs)
+                    lon_c = ax.coords[0]
+                    lat_c = ax.coords[1]
+                    lon_c.set_format_unit(u.deg, decimal=True, show_decimal_unit=True)
+                    lat_c.set_format_unit(u.deg, decimal=True, show_decimal_unit=True)
+                    if str(frame).lower().startswith("gal"):
+                        ax.set_xlabel("l")
+                        ax.set_ylabel("b")
+                    else:
+                        ax.set_xlabel("ra")
+                        ax.set_ylabel("dec")
+                    ax.grid(color="black", linestyle="dotted")
+                    wcs = _wcs
+            else:
+                fig = ax.figure
+
+            order = int(round(np.log2(stage_map.nside_sparse)))
+            order_display = int(self.get_plot_order(wcs))
+            if order_force is not None:
+                target_order = min(int(order_force), order)
+            else:
+                target_order = min(order, order_display)
+
+            if int(stage_map.n_valid) > 0:
+                moc = SkyMaskPipe.moc_from_stage(
+                    stage_map,
+                    order_forced=target_order,
+                    progress=False,
+                )
+                moc.fill(
+                    ax=ax,
+                    wcs=wcs,
+                    alpha=alpha,
+                    fill=True,
+                    color=color,
+                    zorder=1,
+                    label=label,
+                    optimize=False,
+                )
+                moc.border(
+                    ax=ax,
+                    wcs=wcs,
+                    alpha=max(0.6, alpha),
+                    color="k",
+                    linewidth=linewidth,
+                    zorder=2,
+                )
+
+            if show:
+                plt.show()
+            return fig, ax, wcs
+
+        SkyMaskPipe.plot_moc = _streaming_plot_moc  # type: ignore[method-assign]
 
     _PATCHED = True
