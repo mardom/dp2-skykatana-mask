@@ -12,7 +12,29 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-PYTHON_BIN="${PYTHON_BIN:-python}"
+
+# In RSP JupyterLab terminals (unlike the `LSST` notebook kernel), EUPS `lsst_distrib`
+# is not initialized automatically at shell startup. Bootstrap it BEFORE resolving
+# `python` / `pip` so user-space packages and `~/.local/bin/dp2-mask` bind to `rubin-env`.
+if [[ -z "${PYTHON_BIN:-}" ]]; then
+    if ! command -v python >/dev/null 2>&1 || ! python -c "import lsst.daf.butler" >/dev/null 2>&1; then
+        for lsst_loader in \
+            "/opt/lsst/software/stack/loadLSST.bash" \
+            "/opt/lsst/software/stack/loadLSST.sh" \
+            "${LSST_HOME:-}/loadLSST.bash"; do
+            if [[ -n "${lsst_loader}" && -f "${lsst_loader}" ]]; then
+                echo "=== [0/4] Bootstrapping RSP LSST Science Pipelines (${lsst_loader} + setup lsst_distrib) ==="
+                set +u
+                # shellcheck disable=SC1090
+                source "${lsst_loader}"
+                setup lsst_distrib
+                set -u
+                break
+            fi
+        done
+    fi
+    PYTHON_BIN="python"
+fi
 
 echo "=== [1/4] Checking active Python environment ==="
 "${PYTHON_BIN}" -c "import sys; print('Python:', sys.executable, sys.version)"
@@ -41,9 +63,14 @@ echo "=== [3/4] Installing latest SkyKatana from GitHub main (--no-deps) ==="
     "git+https://github.com/samotracio/skykatana.git@main"
 
 echo "=== [4/4] Installing dp2-skykatana-mask editable (--no-deps) ==="
-"${PYTHON_BIN}" -m pip install "${PIP_USER_FLAG[@]}" --no-deps -e "${REPO_ROOT}"
+# `--force-reinstall` rewrites `~/.local/bin/dp2-mask` shebang to the active `rubin-env` Python
+"${PYTHON_BIN}" -m pip install "${PIP_USER_FLAG[@]}" --force-reinstall --no-deps -e "${REPO_ROOT}"
 
 echo "=== Setup complete! Verifying imports ==="
 "${PYTHON_BIN}" -c "import skykatana, dp2_skykatana_mask; print('skykatana:', getattr(skykatana, '__version__', 'installed'), '| dp2_skykatana_mask:', dp2_skykatana_mask.__version__)"
-echo "Tip: Make sure ~/.local/bin is on PATH if running on RSP:"
+if [[ -f "/opt/lsst/software/stack/loadLSST.bash" ]]; then
+    "${PYTHON_BIN}" -c "import lsst.daf.butler as b; print('lsst.daf.butler OK:', b.__file__)"
+fi
+echo "Tip: In any new RSP terminal tab, ensure lsst_distrib and ~/.local/bin are active:"
+echo "  source /opt/lsst/software/stack/loadLSST.bash && setup lsst_distrib"
 echo "  export PATH=\"\$HOME/.local/bin:\$PATH\""

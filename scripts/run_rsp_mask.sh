@@ -13,6 +13,27 @@ fi
 
 export PATH="${HOME}/.local/bin:${PATH}"
 
+# Automatically initialize EUPS `lsst_distrib` in fresh RSP terminals / tmux sessions
+if [[ -z "${PYTHON_BIN:-}" ]]; then
+    if ! command -v python >/dev/null 2>&1 || ! python -c "import lsst.daf.butler" >/dev/null 2>&1; then
+        for lsst_loader in \
+            "/opt/lsst/software/stack/loadLSST.bash" \
+            "/opt/lsst/software/stack/loadLSST.sh" \
+            "${LSST_HOME:-}/loadLSST.bash"; do
+            if [[ -n "${lsst_loader}" && -f "${lsst_loader}" ]]; then
+                echo "=== Initializing RSP LSST Science Pipelines (${lsst_loader} + setup lsst_distrib) ==="
+                set +u
+                # shellcheck disable=SC1090
+                source "${lsst_loader}"
+                setup lsst_distrib
+                set -u
+                break
+            fi
+        done
+    fi
+    PYTHON_BIN="python"
+fi
+
 # Prevent OpenMP/BLAS thread explosion on 64-core shared Kubernetes nodes
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-2}"
 export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-2}"

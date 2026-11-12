@@ -10,12 +10,32 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 from pathlib import Path
 from typing import Any, Sequence
 
 from .config import MaskPipelineConfig
 
 logger = logging.getLogger(__name__)
+
+
+_RSP_STACK_LOADERS = (
+    Path("/opt/lsst/software/stack/loadLSST.bash"),
+    Path("/opt/lsst/software/stack/loadLSST.sh"),
+)
+
+
+def find_rsp_stack_loader() -> Path | None:
+    """Return the RSP LSST stack loader script if running inside an RSP/Rubin container."""
+    candidates = list(_RSP_STACK_LOADERS)
+    lsst_home = os.environ.get("LSST_HOME", "").strip()
+    if lsst_home:
+        candidates.append(Path(lsst_home) / "loadLSST.bash")
+        candidates.append(Path(lsst_home) / "loadLSST.sh")
+    for path in candidates:
+        if path.is_file():
+            return path
+    return None
 
 
 def open_dp2_butler(cfg: MaskPipelineConfig) -> Any:
@@ -33,11 +53,22 @@ def open_dp2_butler(cfg: MaskPipelineConfig) -> Any:
     try:
         from lsst.daf.butler import Butler
     except ImportError as exc:
+        rsp_loader = find_rsp_stack_loader()
+        if rsp_loader is not None:
+            raise ImportError(
+                f"lsst.daf.butler is not loaded in this RSP terminal shell "
+                f"(found stack loader at '{rsp_loader}', active Python is '{sys.executable}').\n"
+                f"In RSP terminals (unlike the Jupyter LSST kernel), activate EUPS first:\n"
+                f"  source {rsp_loader}\n"
+                f"  setup lsst_distrib\n"
+                f"And if you ran ./scripts/setup_rsp.sh before activating lsst_distrib, "
+                f"re-run ./scripts/setup_rsp.sh once so ~/.local/bin/dp2-mask binds to rubin-env."
+            ) from exc
         raise ImportError(
             "lsst.daf.butler is not installed in the active Python environment. "
-            "Run inside the RSP LSST kernel (after running scripts/setup_rsp.sh), "
-            "or install `lsst-daf-butler` with an RSP access token, or pass a "
-            "synthetic MockButler for local testing (`dp2-mask demo-synthetic`)."
+            "On the RSP terminal, run `source /opt/lsst/software/stack/loadLSST.bash && setup lsst_distrib` "
+            "(or `./scripts/setup_rsp.sh`), use the RSP `LSST` notebook kernel, "
+            "or run `dp2-mask demo-synthetic` for offline local testing."
         ) from exc
 
     token = _resolve_external_token(cfg.access_token_file)

@@ -196,6 +196,37 @@ class TestConfigAndMemory(unittest.TestCase):
         est15 = estimate_working_set_gib(6000.0, order_prop=15, order_star=15, order_out=15)
         self.assertGreater(est15["estimated_peak_ram_gib"], est14["estimated_peak_ram_gib"])
 
+    def test_rsp_terminal_bootstrap_and_diagnostic_error(self) -> None:
+        from unittest import mock
+
+        from dp2_skykatana_mask.butler_io import find_rsp_stack_loader, open_dp2_butler
+        from dp2_skykatana_mask.cli import _maybe_reexec_with_rsp_lsst_distrib
+        from dp2_skykatana_mask.config import MaskPipelineConfig
+
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_loader = Path(tmp) / "loadLSST.bash"
+            fake_loader.write_text("# mock RSP loader\n", encoding="utf-8")
+
+            with mock.patch.dict(os.environ, {"LSST_HOME": tmp}, clear=False):
+                os.environ.pop("_DP2_MASK_RSP_BOOTSTRAPPED", None)
+                self.assertEqual(find_rsp_stack_loader(), fake_loader)
+
+                with self.assertRaises(ImportError) as ctx:
+                    open_dp2_butler(MaskPipelineConfig())
+                self.assertIn("setup lsst_distrib", str(ctx.exception))
+
+                with mock.patch("os.execvp") as mock_execvp:
+                    _maybe_reexec_with_rsp_lsst_distrib(None, "inspect-butler")
+                    mock_execvp.assert_called_once()
+                    args_called = mock_execvp.call_args[0]
+                    self.assertEqual(args_called[0], "bash")
+                    self.assertIn("setup lsst_distrib", args_called[1][2])
+
+                # Guard prevents re-exec loop once _DP2_MASK_RSP_BOOTSTRAPPED == "1"
+                with mock.patch("os.execvp") as mock_execvp_2:
+                    _maybe_reexec_with_rsp_lsst_distrib(None, "inspect-butler")
+                    mock_execvp_2.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

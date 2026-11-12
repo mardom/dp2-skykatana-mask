@@ -5,12 +5,14 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import sys
 from pathlib import Path
 from typing import Sequence
 
 from .butler_io import (
     discover_monster_dataset,
+    find_rsp_stack_loader,
     list_consolidated_maps,
     open_dp2_butler,
 )
@@ -213,10 +215,40 @@ def _cmd_demo_synthetic(args: argparse.Namespace) -> int:
     return 0
 
 
+def _maybe_reexec_with_rsp_lsst_distrib(argv: Sequence[str] | None, command: str) -> None:
+    """Auto-bootstrap `loadLSST.bash` + `setup lsst_distrib` once in fresh RSP terminals."""
+    if argv is not None or command not in ("build", "inspect-butler"):
+        return
+    if os.environ.get("_DP2_MASK_RSP_BOOTSTRAPPED") == "1":
+        return
+    try:
+        import lsst.daf.butler  # noqa: F401
+        return
+    except ImportError:
+        pass
+
+    loader = find_rsp_stack_loader()
+    if loader is None:
+        return
+
+    src_root = str(Path(__file__).resolve().parents[1])
+    logging.getLogger(__name__).info(
+        "RSP terminal without active `lsst_distrib` detected; bootstrapping `%s` + `setup lsst_distrib`...",
+        loader,
+    )
+    os.environ["_DP2_MASK_RSP_BOOTSTRAPPED"] = "1"
+    bash_cmd = (
+        f'source "{loader}" && setup lsst_distrib && '
+        f'PYTHONPATH="{src_root}:${{PYTHONPATH:-}}" exec python -m dp2_skykatana_mask.cli "$@"'
+    )
+    os.execvp("bash", ["bash", "-c", bash_cmd, "dp2-mask", *sys.argv[1:]])
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
     _configure_logging(verbose=bool(args.verbose))
+    _maybe_reexec_with_rsp_lsst_distrib(argv, str(args.command))
 
     dispatch = {
         "build": _cmd_build,

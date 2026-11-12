@@ -28,11 +28,14 @@ Combines:
    git clone git@github.com:mardom/dp2-skykatana-mask.git
    cd dp2-skykatana-mask
    ```
-2. Install `skykatana` (latest `main`) + `dp2-skykatana-mask` safely on top of `rubin-env` (`--user --no-deps`, preserving `lsst.daf.butler`, `rubin_sim`, `numpy`, `pyarrow`, and `healsparse`):
+2. Activate the RSP LSST Science Pipelines in the terminal (Jupyter's `LSST` notebook kernel loads this automatically, whereas fresh RSP terminal shells do not) and install `skykatana` (latest `main`) + `dp2-skykatana-mask` safely (`--user --no-deps`, preserving `lsst.daf.butler`, `rubin_sim`, `numpy`, `pyarrow`, and `healsparse`):
    ```bash
+   source /opt/lsst/software/stack/loadLSST.bash
+   setup lsst_distrib
    ./scripts/setup_rsp.sh
    export PATH="$HOME/.local/bin:$PATH"
    ```
+   *(Note: `./scripts/setup_rsp.sh`, `./scripts/run_rsp_mask.sh`, and `dp2-mask` also auto-detect `/opt/lsst/software/stack/loadLSST.bash` and bootstrap `setup lsst_distrib` if you open a fresh terminal or `tmux` session later.)*
 3. Inspect DP2 property maps and `the_monster` dataset in Butler:
    ```bash
    dp2-mask inspect-butler
