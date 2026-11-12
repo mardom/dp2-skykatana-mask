@@ -11,7 +11,7 @@ Combines:
 2. **Milky Way Dust Extinction Correction (`dustmask` & `psf_maglim` de-reddening)** ([DP2 Tutorial 311.1](https://dp2.lsst.io/tutorials/notebook/311/notebook-311-1.html)):
    - Uses Rubin $R_V = 3.1$ bandpass extinction coefficients $R_b = A_b / E(B-V)$ (`[4.81, 3.64, 2.70, 2.06, 1.58, 1.31]` for `u, g, r, i, z, y` via `rubin_sim.phot_utils.DustValues(r_v=3.1).r_x`),
    - De-reddens extragalactic coadd depth per pixel ($m_{b,\mathrm{lim}}^{\mathrm{dered}} = m_{b,\mathrm{lim}}^{\mathrm{obs}} - R_b E(B-V)_{\mathrm{SFD98}}$) during `propmask` streaming,
-   - Builds a bit-packed negative **`dustmask`** stage excluding high-extinction sightlines ($E(B-V) > \texttt{max\_ebv}$) and low Galactic latitudes ($|b| < \texttt{min\_galactic\_lat\_deg}$) where 2D SFD98 maps lose reliability, while keeping foreground bright-star halo magnitudes in *observed* apparent LSST magnitudes.
+   - Builds a bit-packed negative **`dustmask`** stage excluding high-extinction sightlines ($E(B-V)$ > `max_ebv`) and low Galactic latitudes ($|b|$ < `min_galactic_lat_deg`) where 2D SFD98 maps lose reliability, while keeping foreground bright-star halo magnitudes in *observed* apparent LSST magnitudes.
 3. **The Monster Reference Catalog (`the_monster`) + SkyKatana `radfunction`** ([DP2 Tutorial 204.2](https://dp2.lsst.io/tutorials/notebook/204/notebook-204-2.html)):
    - Dynamically discovers the latest `the_monster_YYYYMMDD` dataset in Gen3 Butler and queries only `htm7` (`HtmPixelization(7)`) trixels overlapping the valid footprint + maximum star-halo buffer,
    - Converts `SimpleCatalog` coordinates (`radians` -> `degrees`) and synthetic `monster_*_{band}_flux` (`nJy` -> observed LSST `ABmag`, $m_{\mathrm{AB}} = -2.5\log_{10}(f_{\mathrm{nJy}}) + 31.4000656$),
