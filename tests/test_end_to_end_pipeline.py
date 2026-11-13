@@ -145,6 +145,7 @@ class TestEndToEndPipeline(unittest.TestCase):
                 "fracdet_healsparse_hs",
                 "randoms_parquet",
                 "qa_plot_png",
+                "complete_mask_multiscale_png",
                 "summary_json",
             ):
                 self.assertIn(key, summary.output_files)
@@ -308,6 +309,53 @@ class TestEndToEndPipeline(unittest.TestCase):
 
         self.assertIn("mkp", ns)
         self.assertIn("summary", ns)
+        self.assertIn("fig_ms", ns)
+
+    def test_wide_wrap_survey_multiscale_visualizations(self) -> None:
+        import healpy as hp
+
+        from dp2_skykatana_mask import (
+            compute_sky_extent,
+            extract_zoom_subpipe,
+            plot_complete_mask_allsky,
+            plot_complete_mask_fracmap,
+            plot_complete_mask_multiscale,
+            select_dense_zoom_box,
+        )
+
+        pipe = SkyMaskPipe(order_out=10, order_cov=5)
+        nside = 1 << 9
+        prop = hsp.HealSparseMap.make_empty(32, nside, dtype=np.bool_)
+        all_pix = np.arange(hp.nside2npix(nside), dtype=np.int64)
+        ra_all, dec_all = hp.pix2ang(nside, all_pix, nest=True, lonlat=True)
+        in_wfd = ((ra_all >= 290.0) | (ra_all <= 30.0)) & (dec_all >= -40.0) & (dec_all <= -22.0)
+        prop.update_values_pix(all_pix[in_wfd], True)
+        pipe.propmask = prop.as_bit_packed_map()
+        pipe.build_milkyway_mask(order_sparse=8, order_cov=5, b0_deg=12.0, bit_packed=True)
+        pipe.combine(
+            positive=["propmask"],
+            negative=["mwmask"],
+            order_out=10,
+            order_cov=5,
+            bit_packed=True,
+            verbose=False,
+        )
+
+        ext = compute_sky_extent(pipe, "mask")
+        self.assertTrue(ext["wraps_zero"])
+        self.assertTrue(ext["wide_survey"])
+        self.assertLess(ext["ra_span"], 115.0)
+
+        clip_ra, clip_dec = select_dense_zoom_box(pipe, half_width_deg=0.3)
+        sub_pipe = extract_zoom_subpipe(pipe, clip_ra, clip_dec)
+        self.assertGreater(int(sub_pipe.mask.n_valid), 50)
+
+        fig1, _ = plot_complete_mask_multiscale(pipe, show=False)
+        plt.close(fig1)
+        fig2, _, _ = plot_complete_mask_fracmap(pipe, show=False)
+        plt.close(fig2)
+        fig3, _, _ = plot_complete_mask_allsky(pipe, show=False)
+        plt.close(fig3)
 
 
 if __name__ == "__main__":

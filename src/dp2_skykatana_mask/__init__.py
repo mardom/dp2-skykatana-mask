@@ -36,6 +36,14 @@ from .monster_stars import (
 )
 from .pipeline import DP2MaskBuilder, MaskBuildSummary
 from .property_mask import PropertyMaskStats, build_dp2_property_mask
+from .visualization import (
+    compute_sky_extent,
+    extract_zoom_subpipe,
+    plot_complete_mask_allsky,
+    plot_complete_mask_fracmap,
+    plot_complete_mask_multiscale,
+    select_dense_zoom_box,
+)
 
 __version__ = "0.2.0"
 
@@ -62,10 +70,16 @@ __all__ = [
     "build_monster_hats_star_mask_online",
     "build_monster_star_mask",
     "compute_band_extinction_mag",
+    "compute_sky_extent",
     "deredden_magnitude",
+    "extract_zoom_subpipe",
     "flux_njy_to_abmag",
     "get_rubin_band_extinction_rx",
     "load_config",
     "make_skykatana_radfunction",
+    "plot_complete_mask_allsky",
+    "plot_complete_mask_fracmap",
+    "plot_complete_mask_multiscale",
+    "select_dense_zoom_box",
     "skykatana_lsst_radfunction",
 ]

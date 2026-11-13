@@ -267,7 +267,9 @@ def apply_skykatana_runtime_fixes() -> None:
             if order_force is not None:
                 target_order = min(int(order_force), order)
             else:
-                target_order = min(order, order_display)
+                # Super-sample by +1 order above 1-cell-per-pixel so circular star holes
+                # and curved boundaries render smoothly without staircase artifacts.
+                target_order = min(order, order_display + 1)
 
             if int(stage_map.n_valid) > 0:
                 moc = SkyMaskPipe.moc_from_stage(
@@ -281,18 +283,20 @@ def apply_skykatana_runtime_fixes() -> None:
                     alpha=alpha,
                     fill=True,
                     color=color,
+                    linewidth=0,
                     zorder=1,
                     label=label,
                     optimize=False,
                 )
-                moc.border(
-                    ax=ax,
-                    wcs=wcs,
-                    alpha=max(0.6, alpha),
-                    color="k",
-                    linewidth=linewidth,
-                    zorder=2,
-                )
+                if linewidth is not None and float(linewidth) > 0.0:
+                    moc.border(
+                        ax=ax,
+                        wcs=wcs,
+                        alpha=max(0.6, alpha),
+                        color="k",
+                        linewidth=linewidth,
+                        zorder=2,
+                    )
 
             if show:
                 plt.show()

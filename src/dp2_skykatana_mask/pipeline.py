@@ -258,6 +258,27 @@ class DP2MaskBuilder:
             qa_path = out_dir / "dp2_mask_qa.png"
             _render_qa_plot(self.pipe, summary, qa_path)
             summary.output_files["qa_plot_png"] = str(qa_path)
+            if self.pipe.mask is not None and int(self.pipe.mask.n_valid) > 0:
+                import matplotlib.pyplot as plt
+
+                from .visualization import plot_complete_mask_multiscale
+
+                circ_p = (
+                    summary.monster_stars.circles_parquet_path
+                    if summary.monster_stars is not None
+                    else None
+                )
+                box_p = out_dir / "monster_bleed_boxes.fits"
+                ms_path = out_dir / "dp2_complete_mask_multiscale.png"
+                fig_ms, _ = plot_complete_mask_multiscale(
+                    self.pipe,
+                    circles_path=circ_p,
+                    boxes_path=box_p if box_p.is_file() else None,
+                    show=False,
+                    save_path=ms_path,
+                )
+                plt.close(fig_ms)
+                summary.output_files["complete_mask_multiscale_png"] = str(ms_path)
 
         summary_path = summary.write_json(out_dir / "mask_build_summary.json")
         summary.output_files["summary_json"] = str(summary_path)
@@ -377,17 +398,27 @@ def _render_qa_plot(pipe: SkyMaskPipe, summary: MaskBuildSummary, out_path: Path
             fontsize=8,
         )
 
-    # Panel 2: Uniform random sample over surviving mask (fast & bounded RAM)
+    # Panel 2: Wrap-aware uniform random sample over surviving mask (fast & bounded RAM)
     ax1 = axes[1]
     if pipe.mask is not None and int(pipe.mask.n_valid) > 0:
+        from matplotlib.ticker import FuncFormatter
+
+        from .visualization import compute_sky_extent
+
+        ext = compute_sky_extent(pipe, "mask")
         rng = np.random.RandomState(42)
-        sample_df = pipe.makerans(stage="mask", nr=min(15_000, max(2_000, int(pipe.mask.n_valid))), rng=rng)
+        sample_df = pipe.makerans(stage="mask", nr=min(25_000, max(3_000, int(pipe.mask.n_valid))), rng=rng)
+        ra_vals = sample_df["ra"].to_numpy(dtype=np.float64) % 360.0
+        if ext["wraps_zero"]:
+            cut = float((ext["ra_start"] - 5.0) % 360.0)
+            ra_vals = np.where(ra_vals >= cut, ra_vals - 360.0, ra_vals)
+            ax1.xaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v % 360.0:.0f}"))
         ax1.scatter(
-            sample_df["ra"],
+            ra_vals,
             sample_df["dec"],
-            s=1.2,
-            alpha=0.5,
-            color="#1f77b4",
+            s=0.8,
+            alpha=0.55,
+            color="#0f766e",
             rasterized=True,
             label="Unmasked sky (makerans)",
         )
@@ -399,7 +430,7 @@ def _render_qa_plot(pipe: SkyMaskPipe, summary: MaskBuildSummary, out_path: Path
             if summary.monster_stars is not None
             else ""
         )
-        ax1.set_title(f"Surviving DP2 Mask ({summary.final_area_deg2:.2f} deg$^2${star_info})")
+        ax1.set_title(f"Surviving DP2 Mask ({summary.final_area_deg2:,.2f} deg$^2${star_info})")
         ax1.grid(True, alpha=0.25, linestyle="--")
     else:
         ax1.text(0.5, 0.5, "Empty final mask", ha="center", va="center", transform=ax1.transAxes)
