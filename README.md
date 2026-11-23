@@ -55,21 +55,25 @@ Combines:
 
 ## Quickstart Locally (`lsdb_env-py313` + External RSP / Gaia TAP)
 
-You can also run the full DP2 SkyKatana masking workflow **locally outside the RSP** using `notebooks/02_DP2_Skykatana_Mask_Local_TAP.ipynb`:
-- Reconstructs per-band exposure counts, inverse-variance coadd $5\sigma$ limiting magnitudes, PSF seeing, and **Tutorial 311.1** dust-dereddened `propmask` directly from **`dp2.VisitDetector`** + **`ivoa.ObsCore`** via `https://data.lsst.cloud/api/tap` (authenticated with `~/.rsp-tap.token` or `$RSP_ACCESS_TOKEN`, `read:tap` scope),
+`notebooks/02_DP2_Skykatana_Mask_Local_TAP.ipynb` and `./scripts/run_local_tap_mask.sh` (`DP2LocalTapMaskBuilder`) mirror the RSP workflow 1-to-1 for local execution via IVOA TAP:
+- Stacks per-band exposure counts, inverse-variance coadd $5\sigma$ limiting magnitudes, PSF seeing, and **Tutorial 311.1** dust-dereddened `propmask` from **`dp2.VisitDetector`** + **`ivoa.ObsCore`** at https://data.lsst.cloud/api/tap (`~/.rsp-tap.token` or `$RSP_ACCESS_TOKEN`, `read:tap` scope; streamed in $30^\circ$ RA stripes on full-survey DP2 runs),
 - Queries SFD98 `ebv` from **`dp2.Object`** via TAP (or local `dustmaps`) to build `dustmask`,
-- Queries public **ESA Gaia DR3 TAP** (`https://gea.esac.esa.int/tap-server/tap`), transforms $(G, G_{\mathrm{BP}} - G_{\mathrm{RP}}) \to$ synthetic LSST `ugrizy` AB magnitudes, and runs `skykatana_lsst_radfunction` to build `starmask` + `boxmask` (falling back automatically to `SyntheticDP2TapService` when offline).
+- Queries public **ESA Gaia DR3 TAP** (https://gea.esac.esa.int/tap-server/tap), transforms $(G, G_{\mathrm{BP}} - G_{\mathrm{RP}}) \to$ synthetic LSST `ugrizy` AB magnitudes, and runs `skykatana_lsst_radfunction` for `starmask` + `boxmask` (with automatic offline fallback to `SyntheticDP2TapService`).
 
 ```bash
 # Install latest SkyKatana + editable dp2-skykatana-mask into lsdb_env-py313
 /home/mardom/miniconda3/envs/lsdb_env-py313/bin/pip install --upgrade --no-deps git+https://github.com/samotracio/skykatana.git@main
 /home/mardom/miniconda3/envs/lsdb_env-py313/bin/pip install --no-deps -e .
 
-# Optional: store your RSP token (read:tap scope) for live local queries against data.lsst.cloud
+# Store your RSP token (read:tap scope) for live local queries against data.lsst.cloud:
 printf '%s\n' 'gt-YOUR_RSP_TOKEN_HERE' > ~/.rsp-tap.token
 chmod 600 ~/.rsp-tap.token
 
-# Run full offline synthetic DP2 verification (or launch notebooks/02_DP2_Skykatana_Mask_Local_TAP.ipynb)
+# Build the ECDFS pilot or the complete full-survey DP2 mask locally via IVOA TAP:
+./scripts/run_local_tap_mask.sh configs/dp2_ecdfs_pilot.yaml
+./scripts/run_local_tap_mask.sh configs/dp2_wfd_default.yaml
+
+# Or run full offline synthetic DP2 verification:
 /home/mardom/miniconda3/envs/lsdb_env-py313/bin/dp2-mask demo-synthetic --output-dir outputs/demo_synthetic
 ```
 

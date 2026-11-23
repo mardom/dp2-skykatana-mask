@@ -39,6 +39,7 @@ from .property_mask import PropertyMaskStats, build_dp2_property_mask
 from .tap_local import (
     DEFAULT_GAIA_TAP_URL,
     DEFAULT_RSP_TAP_URL,
+    DP2LocalTapMaskBuilder,
     IVOATapClient,
     SyntheticDP2TapService,
     TapSchemaInfo,
@@ -68,6 +69,7 @@ __all__ = [
     "DEFAULT_GAIA_TAP_URL",
     "DEFAULT_RSP_TAP_URL",
     "DEFAULT_RUBIN_RX_RV31",
+    "DP2LocalTapMaskBuilder",
     "DP2MaskBuilder",
     "DustExtinctionConfig",
     "DustMaskStats",

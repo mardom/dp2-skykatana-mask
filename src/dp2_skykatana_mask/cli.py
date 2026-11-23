@@ -48,14 +48,37 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable debug logging")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    # 1. build
-    p_build = sub.add_parser("build", help="Run the DP2 SkyKatana mask builder from a YAML config")
+    # 1. build (RSP / Gen3 Butler)
+    p_build = sub.add_parser("build", help="Run the DP2 SkyKatana mask builder from a YAML config (Gen3 Butler)")
     p_build.add_argument("-c", "--config", required=True, help="Path to YAML configuration file")
     p_build.add_argument("-o", "--output-dir", default=None, help="Override output directory")
     p_build.add_argument(
         "--token-file",
         default=None,
-        help="Optional external RSP Gafaelfawr token file (when running outside RSP)",
+        help="Optional external RSP Gafaelfawr token file (when running RemoteButler outside RSP)",
+    )
+
+    # 1b. build-tap (Local outside-RSP via IVOA TAP: RSP VisitDetector/ObsCore/Object + Gaia DR3 TAP)
+    p_btap = sub.add_parser(
+        "build-tap",
+        help="Run the DP2 SkyKatana mask builder locally via IVOA TAP (data.lsst.cloud/api/tap + Gaia DR3 TAP)",
+    )
+    p_btap.add_argument("-c", "--config", required=True, help="Path to YAML configuration file")
+    p_btap.add_argument("-o", "--output-dir", default=None, help="Override output directory")
+    p_btap.add_argument(
+        "--token-file",
+        default=None,
+        help="RSP Bearer token file with read:tap scope (defaults to ~/.rsp-tap.token or $RSP_ACCESS_TOKEN)",
+    )
+    p_btap.add_argument(
+        "--tap-url",
+        default="https://data.lsst.cloud/api/tap",
+        help="RSP TAP endpoint URL (default: https://data.lsst.cloud/api/tap)",
+    )
+    p_btap.add_argument(
+        "--allow-synthetic-fallback",
+        action="store_true",
+        help="Fall back to offline SyntheticDP2TapService if no RSP token is configured",
     )
 
     # 2. estimate-ram
@@ -116,6 +139,27 @@ def _cmd_build(args: argparse.Namespace) -> int:
     builder = DP2MaskBuilder(cfg)
     est = builder.estimate_memory()
     logging.getLogger(__name__).info("Estimated peak working set: %s", json.dumps(est))
+    _, summary = builder.run()
+    print(json.dumps(summary.to_dict(), indent=2))
+    return 0
+
+
+def _cmd_build_tap(args: argparse.Namespace) -> int:
+    from .tap_local import DP2LocalTapMaskBuilder
+
+    cfg = load_config(args.config)
+    if args.output_dir:
+        cfg.output.output_dir = str(args.output_dir)
+    if args.token_file:
+        cfg.access_token_file = str(args.token_file)
+
+    builder = DP2LocalTapMaskBuilder(
+        cfg,
+        tap_url=str(args.tap_url),
+        allow_synthetic_fallback=bool(args.allow_synthetic_fallback),
+    )
+    est = builder.estimate_memory()
+    logging.getLogger(__name__).info("Estimated local TAP peak working set: %s", json.dumps(est))
     _, summary = builder.run()
     print(json.dumps(summary.to_dict(), indent=2))
     return 0
@@ -252,6 +296,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     dispatch = {
         "build": _cmd_build,
+        "build-tap": _cmd_build_tap,
         "estimate-ram": _cmd_estimate_ram,
         "inspect-butler": _cmd_inspect_butler,
         "demo-synthetic": _cmd_demo_synthetic,

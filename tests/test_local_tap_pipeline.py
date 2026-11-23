@@ -12,8 +12,6 @@ from pathlib import Path
 from unittest import mock
 
 import matplotlib
-import numpy as np
-import pandas as pd
 from astropy.io.votable import from_table
 from astropy.table import Table
 
@@ -21,14 +19,17 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from dp2_skykatana_mask import (
+    DP2LocalTapMaskBuilder,
     IVOATapClient,
     SyntheticDP2TapService,
     discover_dp2_tap_schema,
     gaia_to_synthetic_lsst_magnitudes,
+    load_config,
     open_rsp_tap_client,
     parse_stcs_region_pixels,
     resolve_rsp_tap_token,
 )
+from dp2_skykatana_mask.cli import main as cli_main
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -51,7 +52,6 @@ class TestLocalTapPipeline(unittest.TestCase):
                 "Bearer gt-secret-test-token-123",
             )
 
-            # Verify VOTable HTTP sync parsing without network
             mock_tbl = Table({"ra": [53.1, 53.2], "dec": [-28.1, -28.0]})
             vot = from_table(mock_tbl)
             buf = io.BytesIO()
@@ -76,7 +76,6 @@ class TestLocalTapPipeline(unittest.TestCase):
         circ_pix = parse_stcs_region_pixels("CIRCLE ICRS 53.1 -28.1 0.15", nside=1024)
         self.assertGreater(circ_pix.size, 15)
 
-        # Solar-type star (G=12.0, BP-RP=0.82): g - r ~ 0.46, r - i ~ 0.15, u > g > r > i > z
         mags = gaia_to_synthetic_lsst_magnitudes([12.0], [0.82])
         self.assertAlmostEqual(
             float(mags["lsst_g_mag"][0] - mags["lsst_r_mag"][0]), 0.46, delta=0.08
@@ -85,21 +84,79 @@ class TestLocalTapPipeline(unittest.TestCase):
         self.assertGreater(float(mags["lsst_g_mag"][0]), float(mags["lsst_r_mag"][0]))
         self.assertGreater(float(mags["lsst_r_mag"][0]), float(mags["lsst_i_mag"][0]))
 
-    def test_schema_discovery_and_offline_fallback(self) -> None:
-        with mock.patch.dict(os.environ, {"RSP_ACCESS_TOKEN": "", "ACCESS_TOKEN": ""}, clear=False):
-            with mock.patch("pathlib.Path.home", return_value=Path("/nonexistent_home_for_test")):
-                tap = open_rsp_tap_client(allow_synthetic_fallback=True)
-                self.assertIsInstance(tap, SyntheticDP2TapService)
-                sinfo = discover_dp2_tap_schema(tap)
-                self.assertEqual(sinfo.catalog_schema, "dp2")
-                self.assertEqual(sinfo.visit_detector_table, "dp2.VisitDetector")
-                self.assertTrue(sinfo.has_obscore)
+    def test_full_mode_builder_and_cli_build_tap(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            wfd_cfg = load_config(REPO_ROOT / "configs" / "dp2_wfd_default.yaml")
+            wfd_cfg.output.output_dir = tmpdir
+            wfd_cfg.property_maps.order_sparse = 12
+            wfd_cfg.dust.order_sparse = 11
+            wfd_cfg.monster_stars.order_sparse = 12
+            wfd_cfg.output.order_out = 12
+            wfd_cfg.output.moc_max_order = 11
+            wfd_cfg.output.n_random_points = 3_000
+            # Adjust depth thresholds slightly for synthetic visit counts
+            for b, lim in (("g", 24.8), ("r", 24.5), ("i", 24.1), ("z", 23.4)):
+                wfd_cfg.property_maps.per_band[b].min_exposures = 3
+                wfd_cfg.property_maps.per_band[b].min_maglim = lim
+
+            mock_tap = SyntheticDP2TapService(n_stars=120, n_objects=6_000)
+            builder = DP2LocalTapMaskBuilder(wfd_cfg, tap_client=mock_tap)
+            pipe, summary = builder.run()
+
+            self.assertEqual(summary.region_mode, "full")
+            self.assertGreater(summary.final_area_deg2, 1.0)
+            self.assertIn("mwmask", summary.negative_stages)
+            self.assertIn("complete_mask_multiscale_png", summary.output_files)
+            self.assertTrue(Path(summary.output_files["complete_mask_multiscale_png"]).is_file())
+            self.assertIsNotNone(pipe.mask)
+
+        # Also test CLI `dp2-mask build-tap --allow-synthetic-fallback`
+        with tempfile.TemporaryDirectory() as tmp_cli:
+            # Use order=12 in CLI test so synthetic pilot completes in ~1s instead of order=15!
+            pilot_fast_cfg = REPO_ROOT / "configs" / "dp2_ecdfs_pilot.yaml"
+            fast_yaml = Path(tmp_cli) / "fast_pilot.yaml"
+            cfg_obj = load_config(pilot_fast_cfg)
+            cfg_obj.property_maps.order_sparse = 12
+            cfg_obj.dust.order_sparse = 11
+            cfg_obj.monster_stars.order_sparse = 12
+            cfg_obj.output.order_out = 12
+            cfg_obj.output.moc_max_order = 11
+            cfg_obj.output.n_random_points = 2_000
+            import yaml
+
+            raw_dict = yaml.safe_load(pilot_fast_cfg.read_text(encoding="utf-8"))
+            raw_dict["property_maps"]["order_sparse"] = 12
+            raw_dict["dust"]["order_sparse"] = 11
+            raw_dict["monster_stars"]["order_sparse"] = 12
+            raw_dict["output"]["order_out"] = 12
+            raw_dict["output"]["moc_max_order"] = 11
+            raw_dict["output"]["n_random_points"] = 2000
+            fast_yaml.write_text(yaml.safe_dump(raw_dict), encoding="utf-8")
+
+            with mock.patch.dict(os.environ, {"RSP_ACCESS_TOKEN": "", "ACCESS_TOKEN": ""}, clear=False):
+                with mock.patch("pathlib.Path.home", return_value=Path("/nonexistent_home_for_test")):
+                    rc = cli_main(
+                        [
+                            "build-tap",
+                            "--config",
+                            str(fast_yaml),
+                            "--output-dir",
+                            tmp_cli,
+                            "--allow-synthetic-fallback",
+                        ]
+                    )
+                    self.assertEqual(rc, 0)
+                    self.assertTrue((Path(tmp_cli) / "dp2_complete_mask_multiscale.png").is_file())
 
     def test_local_tap_notebook_02_executes_cleanly(self) -> None:
+        nb_rsp = json.loads((REPO_ROOT / "notebooks" / "01_DP2_Skykatana_Mask_RSP.ipynb").read_text(encoding="utf-8"))
         nb_path = REPO_ROOT / "notebooks" / "02_DP2_Skykatana_Mask_Local_TAP.ipynb"
         nb_json = json.loads(nb_path.read_text(encoding="utf-8"))
+        rsp_code_cells = [c for c in nb_rsp["cells"] if c.get("cell_type") == "code"]
         code_cells = [c for c in nb_json["cells"] if c.get("cell_type") == "code"]
-        self.assertGreaterEqual(len(code_cells), 6)
+        # Both notebooks share the exact same 21-cell / 11-or-13 code-cell structure!
+        self.assertEqual(len(nb_json["cells"]), len(nb_rsp["cells"]))
+        self.assertEqual(len(code_cells), len(rsp_code_cells))
 
         ns: dict[str, object] = {"display": lambda *args, **kwargs: None}
         outputs_dir = REPO_ROOT / "outputs"
@@ -116,27 +173,24 @@ class TestLocalTapPipeline(unittest.TestCase):
                         exec(compile(src, f"{nb_path.name}#cell-{idx}-{cell.get('id')}", "exec"), ns)
                         plt.close("all")
 
-            # Verify output artifacts from Notebook 02 before cleanup
-            local_out = REPO_ROOT / "outputs" / "local_tap_ecdfs"
-            self.assertTrue((local_out / "dp2_local_tap_complete_mask.png").is_file())
-            self.assertTrue((local_out / "dp2_local_tap_fracmap.png").is_file())
-            self.assertTrue((local_out / "dp2_local_tap_allsky.png").is_file())
-            self.assertTrue((local_out / "dp2_local_tap_mask_moc.fits").is_file())
-            self.assertTrue((local_out / "dp2_local_tap_clean_galaxies.parquet").is_file())
+            self.assertIn("mkp", ns)
+            self.assertIn("auto_pipe", ns)
+            self.assertIn("summary", ns)
+            self.assertIn("fig_ms", ns)
+            self.assertGreater(float(ns["delta_area"]), 0.0)  # type: ignore[arg-type]
 
-            clean_gal = pd.read_parquet(local_out / "dp2_local_tap_clean_galaxies.parquet")
-            self.assertGreater(len(clean_gal), 1_000)
-            # Dust mask enforced max_ebv = 0.20 ceiling on surviving galaxies!
-            self.assertLessEqual(float(clean_gal["ebv"].max()), 0.215)
+            clean_gal = ns["clean_galaxies"]
+            self.assertGreater(len(clean_gal), 1_000)  # type: ignore[arg-type]
+            self.assertLessEqual(float(clean_gal["ebv"].max()), 0.205)  # type: ignore[index]
+
+            sinfo = discover_dp2_tap_schema(ns["tap_client"])  # type: ignore[arg-type]
+            self.assertEqual(sinfo.visit_detector_table, "dp2.VisitDetector")
         finally:
             os.chdir(orig_cwd)
             plt.show = orig_show
             plt.close("all")
             if not existed_before and outputs_dir.exists():
                 shutil.rmtree(outputs_dir, ignore_errors=True)
-
-        self.assertIn("mkp_local", ns)
-        self.assertIn("clean_gal_df", ns)
 
 
 if __name__ == "__main__":
