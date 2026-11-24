@@ -12,6 +12,7 @@ if [[ $# -gt 0 ]]; then
 fi
 
 export PATH="${HOME}/.local/bin:${PATH}"
+export PYTHONPATH="${REPO_ROOT}/src:${PYTHONPATH:-}"
 
 # Automatically initialize EUPS `lsst_distrib` in fresh RSP terminals / tmux sessions
 if [[ -z "${PYTHON_BIN:-}" ]]; then

@@ -76,7 +76,11 @@ from .memory import (
     configure_rsp_thread_env,
     estimate_working_set_gib,
 )
-from .monster_stars import MonsterStarMaskStats, make_skykatana_radfunction
+from .monster_stars import (
+    MonsterStarMaskStats,
+    build_oriented_bleed_box_mask,
+    make_skykatana_radfunction,
+)
 from .pipeline import FULL_SKY_AREA_DEG2, MaskBuildSummary, _render_qa_plot
 from .property_mask import PropertyMaskStats
 
@@ -1227,28 +1231,17 @@ def build_local_tap_star_mask(
         bright = bright[bright["mag"] <= float(ms_cfg.bleed_mag_max)].reset_index(drop=True)
         n_bleed = len(bright)
         if n_bleed > 0:
-            Table(
-                {
-                    "ra_c": bright["ra"].to_numpy(dtype=np.float64),
-                    "dec_c": bright["dec"].to_numpy(dtype=np.float64),
-                    "width": bright["radius"].to_numpy(dtype=np.float64)
-                    * float(ms_cfg.bleed_width_factor),
-                    "height": bright["radius"].to_numpy(dtype=np.float64)
-                    * float(ms_cfg.bleed_height_factor),
-                }
-            ).write(boxes_fits_path, format="fits", overwrite=True)
-            del bright
-            boxmask = pipe.build_box_mask(
-                data=boxes_fits_path,
+            box_area = build_oriented_bleed_box_mask(
+                pipe=pipe,
+                bright_df=bright,
+                ms_cfg=ms_cfg,
                 order_sparse=order_star,
                 order_cov=order_cov,
-                fmt="fits",
-                columns=["ra_c", "dec_c", "width", "height"],
-                bit_packed=True,
                 n_threads=int(cfg.memory.skykatana_threads),
+                boxes_fits_path=boxes_fits_path,
                 output_stage=box_stage,
             )
-            box_area = float(boxmask.get_valid_area(degrees=True))
+            del bright
             if not ms_cfg.save_star_circles_parquet and boxes_fits_path.exists():
                 boxes_fits_path.unlink()
         else:
@@ -1346,7 +1339,7 @@ class DP2LocalTapMaskBuilder:
                         "radius_deg": self.cfg.region.radius_deg,
                     }
                     if self.cfg.region.mode == "cone" and self.cfg.region.ra_deg is not None
-                    else {}
+                    else ({"wide_dp2_survey": True} if self.cfg.region.mode == "full" else {})
                 ),
             )
         )
@@ -1476,27 +1469,26 @@ class DP2LocalTapMaskBuilder:
         )
 
         if self.cfg.output.make_qa_plots:
-            import matplotlib.pyplot as plt
+            qa_path = out_dir / "dp2_mask_qa.png"
+            _render_qa_plot(self.pipe, summary, qa_path)
+            summary.output_files["qa_plot_png"] = str(qa_path)
+            if self.pipe.mask is not None and int(self.pipe.mask.n_valid) > 0:
+                import matplotlib.pyplot as plt
 
-            from .visualization import plot_complete_mask_multiscale
+                from .visualization import plot_complete_mask_multiscale
 
-            with plt.ioff():
-                qa_path = out_dir / "dp2_mask_qa.png"
-                _render_qa_plot(self.pipe, summary, qa_path)
-                summary.output_files["qa_plot_png"] = str(qa_path)
-                if self.pipe.mask is not None and int(self.pipe.mask.n_valid) > 0:
-                    circ_p = star_stats.circles_parquet_path if star_stats is not None else None
-                    box_p = out_dir / "monster_bleed_boxes.fits"
-                    ms_path = out_dir / "dp2_complete_mask_multiscale.png"
-                    fig_ms, _ = plot_complete_mask_multiscale(
-                        self.pipe,
-                        circles_path=circ_p,
-                        boxes_path=box_p if box_p.is_file() else None,
-                        show=False,
-                        save_path=ms_path,
-                    )
-                    plt.close(fig_ms)
-                    summary.output_files["complete_mask_multiscale_png"] = str(ms_path)
+                circ_p = star_stats.circles_parquet_path if star_stats is not None else None
+                box_p = out_dir / "monster_bleed_boxes.fits"
+                ms_path = out_dir / "dp2_complete_mask_multiscale.png"
+                fig_ms, _ = plot_complete_mask_multiscale(
+                    self.pipe,
+                    circles_path=circ_p,
+                    boxes_path=box_p if box_p.is_file() else None,
+                    show=False,
+                    save_path=ms_path,
+                )
+                plt.close(fig_ms)
+                summary.output_files["complete_mask_multiscale_png"] = str(ms_path)
 
         summary_path = summary.write_json(out_dir / "mask_build_summary.json")
         summary.output_files["summary_json"] = str(summary_path)
@@ -1578,17 +1570,171 @@ class SyntheticDP2TapService:
         n_stars: int = 240,
         n_objects: int = 18_000,
         seed: int = 2026,
+        wide_dp2_survey: bool = False,
     ) -> None:
         self.tap_url = "synthetic://data.lsst.cloud/api/tap"
         self.is_synthetic = True
         self.center_ra_deg = float(center_ra_deg)
         self.center_dec_deg = float(center_dec_deg)
         self.radius_deg = float(radius_deg)
-        self._populate_tables(n_stars=n_stars, n_objects=n_objects, seed=seed)
+        self.wide_dp2_survey = bool(wide_dp2_survey)
+        if self.wide_dp2_survey:
+            self._populate_wide_dp2_tables(n_stars=max(n_stars, 1800), n_objects=max(n_objects, 30_000), seed=seed)
+        else:
+            self._populate_tables(n_stars=n_stars, n_objects=n_objects, seed=seed)
 
     @property
     def backend_name(self) -> str:
         return "synthetic_dp2_tap"
+
+    def _populate_wide_dp2_tables(self, n_stars: int, n_objects: int, seed: int) -> None:
+        """Populate ~2,100 deg^2 multi-band (ugrizy) DP2 WFD + DDF TAP tables for full-survey runs."""
+        rng = np.random.default_rng(seed)
+        nominal_visits = {"u": 4, "g": 5, "r": 6, "i": 6, "z": 5, "y": 4}
+        single_visit_maglim = {
+            "u": 23.42,
+            "g": 24.38,
+            "r": 24.02,
+            "i": 23.62,
+            "z": 22.98,
+            "y": 21.86,
+        }
+        nominal_seeing = {"u": 1.12, "g": 1.02, "r": 0.94, "i": 0.89, "z": 0.87, "y": 0.86}
+
+        # Coarse focal-plane super-blocks covering WFD (RA in [280, 360) U [0, 42], Dec in [-42, -20])
+        # plus ECDFS (53.12, -28.09) and EDFS (60.50, -48.50) across all 6 bands in <1 second
+        ra_centers_wfd = np.concatenate([np.arange(282.0, 360.0, 4.0), np.arange(2.0, 41.0, 4.0)])
+        dec_centers_wfd = np.arange(-40.0, -21.0, 4.0)
+        tile_centers: list[tuple[float, float, float]] = [
+            (float(rc), float(dc), abs(float(dc) + 31.0) / 11.2)
+            for rc in ra_centers_wfd
+            for dc in dec_centers_wfd
+        ]
+        for r0, d0 in ((53.12, -28.09), (60.50, -48.50)):
+            tile_centers.append((r0, d0, 0.15))
+
+        vd_rows: list[dict[str, Any]] = []
+        visit_rows: list[dict[str, Any]] = []
+        visit_id = 2025090001
+        hh_base = 2.08
+
+        for b_idx, (band, n_vis) in enumerate(nominal_visits.items()):
+            max_ef = 1.04 - 0.06 * (b_idx % 3)
+            for v_k in range(n_vis):
+                d_dec_jit = 0.28 * math.sin(2.0 * math.pi * v_k / n_vis)
+                d_ra_jit = 0.28 * math.cos(2.0 * math.pi * v_k / n_vis)
+                visit_rows.append(
+                    {"visitId": visit_id, "band": band, "ra": 0.0, "dec": -31.0, "expTime": 30.0}
+                )
+                det_num = 0
+                for rc0, dc0, ef in tile_centers:
+                    if ef > max_ef and v_k >= 2:
+                        continue
+                    dc = dc0 + d_dec_jit
+                    cos_dc = max(math.cos(math.radians(dc)), 0.15)
+                    rc = (rc0 + d_ra_jit / cos_dc) % 360.0
+                    # Avoid polygons straddling the 0/360 wrap seam directly
+                    hw = min(hh_base / cos_dc, 2.8)
+                    if rc - hw < 0.05 or rc + hw > 359.95:
+                        rc = 2.9 if rc < 180.0 else 357.1
+                    ml = float(single_visit_maglim[band] - 0.34 * (ef**2) + rng.normal(0.0, 0.03))
+                    vd_rows.append(
+                        {
+                            "visitId": visit_id,
+                            "detector": det_num,
+                            "band": band,
+                            "expTime": 30.0,
+                            "seeing": nominal_seeing[band],
+                            "magLim": ml,
+                            "ra": rc,
+                            "dec": dc,
+                            "llcra": rc - hw,
+                            "llcdec": dc - hh_base,
+                            "ulcra": rc - hw,
+                            "ulcdec": dc + hh_base,
+                            "urcra": rc + hw,
+                            "urcdec": dc + hh_base,
+                            "lrcra": rc + hw,
+                            "lrcdec": dc - hh_base,
+                        }
+                    )
+                    det_num += 1
+                visit_id += 1
+
+        self._visit_tbl = Table(rows=visit_rows)
+        self._vd_tbl = Table(rows=vd_rows)
+        self._obscore_tbl = Table(
+            names=(
+                "obs_collection",
+                "dataproduct_type",
+                "dataproduct_subtype",
+                "calib_level",
+                "lsst_band",
+                "s_ra",
+                "s_dec",
+                "s_region",
+            ),
+            dtype=(str, str, str, int, str, float, float, str),
+        )
+
+        # Sample objects across WFD + DDFs with SFD98 E(B-V) cirrus cloud at (304, -30)
+        n_wfd = int(0.92 * n_objects)
+        n_ddf = n_objects - n_wfd
+        ra_wfd = (280.0 + rng.uniform(0.0, 122.0, size=n_wfd)) % 360.0
+        dec_wfd = rng.uniform(-42.0, -20.0, size=n_wfd)
+        ra_ddf = np.concatenate(
+            [
+                rng.normal(53.12, 0.9, size=n_ddf // 2),
+                rng.normal(60.50, 0.9, size=n_ddf - n_ddf // 2),
+            ]
+        ) % 360.0
+        dec_ddf = np.concatenate(
+            [
+                rng.normal(-28.09, 0.8, size=n_ddf // 2),
+                rng.normal(-48.50, 0.8, size=n_ddf - n_ddf // 2),
+            ]
+        )
+        obj_ra = np.concatenate([ra_wfd, ra_ddf])
+        obj_dec = np.clip(np.concatenate([dec_wfd, dec_ddf]), -85.0, 85.0)
+        dra_c = ((obj_ra - 304.0 + 180.0) % 360.0 - 180.0) * math.cos(math.radians(-30.0))
+        ddec_c = obj_dec - (-30.0)
+        ebv = 0.022 + 0.21 * np.exp(-((dra_c / 4.8) ** 2 + (ddec_c / 4.2) ** 2))
+        rx = get_rubin_band_extinction_rx(r_v=3.1)
+        g_intr = rng.uniform(20.2, 24.8, size=n_objects)
+        r_intr = g_intr - rng.uniform(0.3, 0.9, size=n_objects)
+        i_intr = r_intr - rng.uniform(0.15, 0.45, size=n_objects)
+        self._object_tbl = Table(
+            {
+                "objectId": np.arange(8_000_000, 8_000_000 + n_objects, dtype=np.int64),
+                "coord_ra": obj_ra,
+                "coord_dec": obj_dec,
+                "ebv": ebv.astype(np.float32),
+                "refExtendedness": np.ones(n_objects, dtype=np.int16),
+                "g_cModelMag": (g_intr + rx["g"] * ebv).astype(np.float32),
+                "r_cModelMag": (r_intr + rx["r"] * ebv).astype(np.float32),
+                "i_cModelMag": (i_intr + rx["i"] * ebv).astype(np.float32),
+                "g_psfMag": (g_intr + rx["g"] * ebv).astype(np.float32),
+                "r_psfMag": (r_intr + rx["r"] * ebv).astype(np.float32),
+                "i_psfMag": (i_intr + rx["i"] * ebv).astype(np.float32),
+            }
+        )
+
+        s_ra = (280.0 + rng.uniform(0.0, 122.0, size=n_stars)) % 360.0
+        s_dec = rng.uniform(-42.0, -20.0, size=n_stars)
+        s_g = np.concatenate(
+            [
+                np.array([7.8, 8.6, 9.4, 10.2, 11.0, 11.6], dtype=np.float64),
+                rng.uniform(12.0, 18.2, size=max(0, n_stars - 6)),
+            ]
+        )[:n_stars]
+        self._gaia_tbl = Table(
+            {
+                "ra": s_ra,
+                "dec": s_dec,
+                "phot_g_mean_mag": s_g,
+                "bp_rp": rng.uniform(0.35, 2.0, size=n_stars),
+            }
+        )
 
     def _populate_tables(self, n_stars: int, n_objects: int, seed: int) -> None:
         rng = np.random.default_rng(seed)

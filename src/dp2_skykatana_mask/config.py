@@ -250,8 +250,9 @@ class MonsterStarConfig:
     # Optional bleed-trail rectangular box masks for ultra-bright saturated stars
     enable_bleed_boxes: bool = False
     bleed_mag_max: float = 11.5
-    bleed_width_factor: float = 0.25   # Box RA/X width in units of circle radius
-    bleed_height_factor: float = 2.5   # Box Dec/Y length in units of circle radius
+    bleed_width_factor: float = 0.25   # Minor-axis width in units of circle radius
+    bleed_height_factor: float = 2.5   # Major-axis length in units of circle radius
+    bleed_pa_deg: float = 0.0          # Position angle [deg East of North] of bleed long axis (0 = N-S, 90 = E-W)
 
     save_star_circles_parquet: bool = True
 
@@ -322,7 +323,7 @@ class OutputConfig:
     write_moc_fits: bool = True
     moc_max_order: int | None = 13  # Cap MOC export order if desired for fast visualization
     write_fracdet_map: bool = True
-    fracdet_order: int = 10  # NSIDE=1024 fractional area map via SkyMaskPipe.frac_area_map
+    fracdet_order: int = 7  # Coarse NSIDE=128 (~27.5') fractional area map via SkyMaskPipe.frac_area_map
     n_random_points: int = 200_000  # 0 disables random catalog generation via SkyMaskPipe.makerans
     random_seed: int = 20261111
     make_qa_plots: bool = True

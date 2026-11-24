@@ -346,11 +346,21 @@ def plot_complete_mask_multiscale(
         if (circles_path is not None and Path(circles_path).is_file())
         else False
     )
-    box_dict: dict[str, Any] | bool = (
-        {"data": str(boxes_path), "fmt": "fits", "columns": ["ra_c", "dec_c", "width", "height"]}
-        if (boxes_path is not None and Path(boxes_path).is_file())
-        else False
-    )
+    has_box_file = boxes_path is not None and Path(boxes_path).is_file()
+    oriented_boxes_tbl = None
+    box_dict: dict[str, Any] | bool = False
+    if has_box_file:
+        from astropy.table import Table
+
+        bt = Table.read(str(boxes_path), format="fits")
+        if all(c in bt.colnames for c in ("ra0", "ra1", "ra2", "ra3", "dec0", "dec1", "dec2", "dec3")):
+            oriented_boxes_tbl = bt
+        else:
+            box_dict = {
+                "data": str(boxes_path),
+                "fmt": "fits",
+                "columns": ["ra_c", "dec_c", "width", "height"],
+            }
 
     fig = plt.figure(figsize=(14.2, 5.8) if wide else (13.6, 6.0))
     gs = fig.add_gridspec(1, 2, width_ratios=[1.35, 1.0] if wide else [1.05, 1.0], wspace=0.22)
@@ -473,6 +483,25 @@ def plot_complete_mask_multiscale(
             color="#0f766e",
             alpha=0.68,
         )
+    if oriented_boxes_tbl is not None and len(oriented_boxes_tbl) > 0:
+        from matplotlib.patches import Polygon
+
+        in_win = (
+            (np.asarray(oriented_boxes_tbl["ra_c"]) >= clip_ra_z[0])
+            & (np.asarray(oriented_boxes_tbl["ra_c"]) <= clip_ra_z[1])
+            & (np.asarray(oriented_boxes_tbl["dec_c"]) >= clip_dec_z[0])
+            & (np.asarray(oriented_boxes_tbl["dec_c"]) <= clip_dec_z[1])
+        )
+        for row in oriented_boxes_tbl[in_win]:
+            verts = [
+                (float(row["ra0"]), float(row["dec0"])),
+                (float(row["ra1"]), float(row["dec1"])),
+                (float(row["ra2"]), float(row["dec2"])),
+                (float(row["ra3"]), float(row["dec3"])),
+            ]
+            ax_zm.add_patch(
+                Polygon(verts, closed=True, fill=False, edgecolor="r", linewidth=0.65, zorder=9)
+            )
     ax_zm.set_xlim(clip_ra_z[1], clip_ra_z[0])  # Astronomical East-left
     ax_zm.set_ylim(clip_dec_z[0], clip_dec_z[1])
     ax_zm.set_xlabel("RA [deg]")
@@ -504,7 +533,9 @@ def plot_complete_mask_fracmap(
     proj, center_sc, fov_seq, figsize_wcs = _build_wcs_framing(ext)
 
     if order_frac is None:
-        eff_order_frac = 8 if wide else min(11, max(6, int(pipe.order_out) - 1))
+        # Coarse LSS / survey-completeness resolution:
+        # order 6 (nside=64, ~55' cells) for wide surveys; order 8 (nside=256, ~13.7' cells) for regional pilots
+        eff_order_frac = 6 if wide else min(8, max(5, int(pipe.order_out) - 2))
     else:
         eff_order_frac = int(order_frac)
 
@@ -653,3 +684,71 @@ def plot_complete_mask_allsky(
     if show:
         _show_figure_safely(fig)
     return fig, ax, wcs
+
+
+def run_mask_script(
+    script_path: str | Path,
+    config_path: str | Path,
+    *,
+    output_dir: str | Path | None = None,
+    extra_args: list[str] | tuple[str, ...] = (),
+) -> dict[str, Any]:
+    """Execute ``run_rsp_mask.sh`` or ``run_local_tap_mask.sh`` directly from a notebook cell.
+
+    Runs the production shell script in a clean child OS process (streaming stdout/stderr
+    live line-by-line into the cell output so multi-GiB build buffers are 100% released
+    back to the OS / 32 GiB RSP container as soon as the script finishes) and returns the
+    parsed ``mask_build_summary.json`` dictionary.
+    """
+    import json
+    import os
+    import subprocess
+    import sys
+
+    from .config import load_config
+
+    s_path = Path(script_path).resolve()
+    c_path = Path(config_path).resolve()
+    if not s_path.is_file():
+        raise FileNotFoundError(f"Mask runner script not found: {s_path}")
+    if not c_path.is_file():
+        raise FileNotFoundError(f"YAML configuration file not found: {c_path}")
+
+    cmd = ["bash", str(s_path), str(c_path)]
+    if output_dir is not None:
+        cmd.extend(["--output-dir", str(output_dir)])
+    cmd.extend(str(a) for a in extra_args)
+
+    env = dict(os.environ)
+    env["PYTHONUNBUFFERED"] = "1"
+    env.setdefault("PYTHON_BIN", sys.executable)
+
+    tail_lines: list[str] = []
+    with subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+        env=env,
+    ) as proc:
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            print(line, end="", flush=True)
+            tail_lines.append(line)
+            if len(tail_lines) > 40:
+                tail_lines.pop(0)
+        rc = proc.wait()
+    if rc != 0:
+        raise RuntimeError(
+            f"Script {s_path.name} exited with code {rc}.\nLast output:\n{''.join(tail_lines)}"
+        )
+
+    cfg = load_config(c_path)
+    eff_out = Path(output_dir) if output_dir is not None else Path(cfg.output.output_dir)
+    if not eff_out.is_absolute():
+        eff_out = (s_path.parent.parent / eff_out).resolve()
+    summary_file = eff_out / "mask_build_summary.json"
+    if summary_file.is_file():
+        return json.loads(summary_file.read_text(encoding="utf-8"))
+    return {}

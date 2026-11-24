@@ -84,6 +84,7 @@ class SyntheticDP2Butler:
         n_stars: int = 180,
         seed: int = 12345,
         include_dust_filament: bool = True,
+        wide_dp2_survey: bool = False,
     ) -> None:
         self.collections = ["dp2"]
         self.center_ra_deg = float(center_ra_deg)
@@ -92,12 +93,115 @@ class SyntheticDP2Butler:
         self.nside_cov = int(nside_cov)
         self.nside_sparse = int(nside_sparse)
         self.include_dust_filament = bool(include_dust_filament)
+        self.wide_dp2_survey = bool(wide_dp2_survey)
         self._maps: dict[tuple[str, str], hsp.HealSparseMap] = {}
         self._ebv_map: hsp.HealSparseMap | None = None
         self._monster_shards: dict[int, MockSimpleCatalog] = {}
 
-        self._populate_sp_maps(seed=seed)
-        self._populate_monster_shards(n_stars=n_stars, seed=seed + 99)
+        if self.wide_dp2_survey:
+            self._populate_wide_dp2_survey(n_stars=max(n_stars, 1600), seed=seed)
+        else:
+            self._populate_sp_maps(seed=seed)
+            self._populate_monster_shards(n_stars=n_stars, seed=seed + 99)
+
+    def _populate_wide_dp2_survey(self, n_stars: int, seed: int) -> None:
+        """Populate a multi-field ~2,100 deg^2 DP2 WFD + DDF survey across all 6 ugrizy sp_maps."""
+        rng = np.random.default_rng(seed)
+        bands = ("u", "g", "r", "i", "z", "y")
+        nominal_maglim = {"u": 24.1, "g": 25.2, "r": 24.9, "i": 24.5, "z": 23.8, "y": 22.6}
+        nominal_visits = {"u": 5.0, "g": 9.0, "r": 12.0, "i": 12.0, "z": 8.0, "y": 6.0}
+        ddf_fields = ((53.12, -28.09, 2.2), (60.50, -48.50, 2.4))
+
+        # Select coarse nside_cov tiles first so we never allocate full-sky arrays at high order
+        cov_ids = np.arange(hpg.nside_to_npixel(self.nside_cov), dtype=np.int64)
+        c_ra, c_dec = hpg.pixel_to_angle(self.nside_cov, cov_ids, nest=True, degrees=True)
+        cov_keep = ((c_ra >= 277.0) | (c_ra <= 45.0)) & (c_dec >= -45.0) & (c_dec <= -17.0)
+        for r0, d0, rad in ddf_fields:
+            cov_keep[
+                hpg.query_circle(self.nside_cov, r0, d0, rad + 3.5, nest=True, degrees=True)
+            ] = True
+        active_cov = cov_ids[cov_keep]
+
+        shift = 2 * int(round(math.log2(self.nside_sparse // self.nside_cov)))
+        n_sub = 1 << shift
+        cand_pix = (
+            (active_cov[:, None] << shift) + np.arange(n_sub, dtype=np.int64)[None, :]
+        ).ravel()
+        ra_cand, dec_cand = hpg.pixel_to_angle(self.nside_sparse, cand_pix, nest=True, degrees=True)
+
+        in_wfd = ((ra_cand >= 280.0) | (ra_cand <= 42.0)) & (dec_cand >= -42.0) & (dec_cand <= -20.0)
+        in_foot = in_wfd.copy()
+        for r0, d0, rad in ddf_fields:
+            d_ang = np.hypot(
+                ((ra_cand - r0 + 180.0) % 360.0 - 180.0) * math.cos(math.radians(d0)),
+                dec_cand - d0,
+            )
+            in_foot |= d_ang <= rad
+
+        all_pix = cand_pix[in_foot]
+        ra = ra_cand[in_foot]
+        dec = dec_cand[in_foot]
+        in_wfd_sub = in_wfd[in_foot]
+        del cand_pix, ra_cand, dec_cand, in_wfd, in_foot
+
+        # Border distance proxy across WFD strip & DDFs + high-E(B-V) cirrus cloud at (304, -30)
+        edge_frac = np.where(in_wfd_sub, np.abs(dec + 31.0) / 11.2, 2.0)
+        for r0, d0, rad in ddf_fields:
+            ddf_ef = (
+                np.hypot(
+                    ((ra - r0 + 180.0) % 360.0 - 180.0) * math.cos(math.radians(d0)),
+                    dec - d0,
+                )
+                / rad
+            )
+            edge_frac = np.minimum(edge_frac, ddf_ef)
+        edge_frac = np.clip(edge_frac, 0.0, 1.15)
+
+        dra_c = ((ra - 304.0 + 180.0) % 360.0 - 180.0) * math.cos(math.radians(-30.0))
+        ddec_c = dec - (-30.0)
+        ebv_vals = 0.022 + 0.21 * np.exp(-((dra_c / 4.8) ** 2 + (ddec_c / 4.2) ** 2))
+        ebv_map = hsp.HealSparseMap.make_empty(self.nside_cov, self.nside_sparse, dtype=np.float32)
+        ebv_map.update_values_pix(all_pix, ebv_vals.astype(np.float32))
+        self._ebv_map = ebv_map
+
+        for b_idx, band in enumerate(bands):
+            keep = edge_frac <= (1.06 - 0.05 * (b_idx % 3))
+            bpix = all_pix[keep]
+            ef = edge_frac[keep]
+            n_exp = np.maximum(2.0, np.round(nominal_visits[band] * (1.0 - 0.48 * (ef**2))))
+            exptime = (n_exp * 30.0).astype(np.float32)
+            maglim = (
+                nominal_maglim[band] - 0.45 * (ef**2) + rng.normal(0.0, 0.04, size=bpix.size)
+            ).astype(np.float32)
+            psf_size = np.full(bpix.size, 2.05, dtype=np.float32)
+            sky_noise = np.full(bpix.size, 9.0 + b_idx, dtype=np.float32)
+            sky_bg = np.full(bpix.size, 155.0 + 20.0 * b_idx, dtype=np.float32)
+            for ds_name, values in (
+                ("deepCoadd_exposure_time_consolidated_map_sum", exptime),
+                ("deepCoadd_psf_maglim_consolidated_map_weighted_mean", maglim),
+                ("deepCoadd_psf_size_consolidated_map_weighted_mean", psf_size),
+                ("deepCoadd_sky_noise_consolidated_map_weighted_mean", sky_noise),
+                ("deepCoadd_sky_background_consolidated_map_weighted_mean", sky_bg),
+            ):
+                m = hsp.HealSparseMap.make_empty(self.nside_cov, self.nside_sparse, dtype=np.float32)
+                m.update_values_pix(bpix, values)
+                self._maps[(ds_name, band)] = m
+
+        # Sample bright Monster stars across the valid footprint
+        sel_idx = rng.choice(all_pix.size, size=min(n_stars, all_pix.size), replace=False)
+        s_ra = ra[sel_idx]
+        s_dec = dec[sel_idx]
+        mags_r = np.concatenate(
+            [np.array([7.6, 8.5, 9.3, 10.1, 10.9, 11.4]), rng.uniform(11.8, 17.8, size=max(0, s_ra.size - 6))]
+        )[: s_ra.size]
+        cols: dict[str, np.ndarray] = {
+            "id": np.arange(2_000_000, 2_000_000 + s_ra.size),
+            "coord_ra": np.deg2rad(s_ra),
+            "coord_dec": np.deg2rad(s_dec),
+        }
+        for b_off, band in enumerate(bands):
+            cols[f"monster_ComCam_{band}_flux"] = abmag_to_flux_njy(mags_r + 0.22 * (2 - b_off))
+        self._monster_shards[140001] = MockSimpleCatalog(cols)
 
     def _populate_sp_maps(self, seed: int) -> None:
         rng = np.random.default_rng(seed)

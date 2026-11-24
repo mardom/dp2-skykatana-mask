@@ -57,6 +57,11 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional external RSP Gafaelfawr token file (when running RemoteButler outside RSP)",
     )
+    p_build.add_argument(
+        "--allow-synthetic-fallback",
+        action="store_true",
+        help="Fall back to offline SyntheticDP2Butler if lsst.daf.butler / RSP credentials are unavailable",
+    )
 
     # 1b. build-tap (Local outside-RSP via IVOA TAP: RSP VisitDetector/ObsCore/Object + Gaia DR3 TAP)
     p_btap = sub.add_parser(
@@ -129,6 +134,27 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _adapt_cfg_for_synthetic_fallback(cfg: MaskPipelineConfig) -> None:
+    """Tune HEALPix orders when running offline synthetic emulators so wide-survey DP2 builds
+    finish in ~2-3s with crisp 25.8\" star halos while leaving live RSP/TAP runs untouched.
+    """
+    if cfg.region.mode == "full":
+        cfg.property_maps.order_sparse = min(int(cfg.property_maps.order_sparse), 11)
+        cfg.dust.order_sparse = min(int(cfg.dust.order_sparse), 10)
+        cfg.monster_stars.order_sparse = min(int(cfg.monster_stars.order_sparse), 13)
+        cfg.output.order_out = min(int(cfg.output.order_out), 13)
+        if cfg.output.moc_max_order is not None:
+            cfg.output.moc_max_order = min(int(cfg.output.moc_max_order), 11)
+        cfg.output.fracdet_order = min(int(cfg.output.fracdet_order), 6)
+        cfg.output.n_random_points = min(int(cfg.output.n_random_points), 50_000)
+    else:
+        cfg.property_maps.order_sparse = min(int(cfg.property_maps.order_sparse), 13)
+        cfg.dust.order_sparse = min(int(cfg.dust.order_sparse), 13)
+        cfg.monster_stars.order_sparse = min(int(cfg.monster_stars.order_sparse), 13)
+        cfg.output.order_out = min(int(cfg.output.order_out), 13)
+        cfg.output.n_random_points = min(int(cfg.output.n_random_points), 50_000)
+
+
 def _cmd_build(args: argparse.Namespace) -> int:
     cfg = load_config(args.config)
     if args.output_dir:
@@ -136,7 +162,30 @@ def _cmd_build(args: argparse.Namespace) -> int:
     if args.token_file:
         cfg.access_token_file = str(args.token_file)
 
-    builder = DP2MaskBuilder(cfg)
+    butler = None
+    if getattr(args, "allow_synthetic_fallback", False):
+        try:
+            butler = open_dp2_butler(cfg)
+        except Exception as exc:
+            logging.getLogger(__name__).warning(
+                "Live Gen3 Butler unavailable (%s) -> using SyntheticDP2Butler fallback.", exc
+            )
+            _adapt_cfg_for_synthetic_fallback(cfg)
+            if cfg.region.mode == "full":
+                butler = SyntheticDP2Butler(
+                    nside_sparse=1 << int(cfg.property_maps.order_sparse),
+                    wide_dp2_survey=True,
+                )
+            else:
+                butler = SyntheticDP2Butler(
+                    center_ra_deg=cfg.region.ra_deg or 53.1222,
+                    center_dec_deg=cfg.region.dec_deg or -28.0870,
+                    radius_deg=cfg.region.radius_deg or 1.5,
+                    nside_sparse=1 << int(cfg.property_maps.order_sparse),
+                    n_stars=250,
+                )
+
+    builder = DP2MaskBuilder(cfg, butler=butler)
     est = builder.estimate_memory()
     logging.getLogger(__name__).info("Estimated peak working set: %s", json.dumps(est))
     _, summary = builder.run()
@@ -145,13 +194,16 @@ def _cmd_build(args: argparse.Namespace) -> int:
 
 
 def _cmd_build_tap(args: argparse.Namespace) -> int:
-    from .tap_local import DP2LocalTapMaskBuilder
+    from .tap_local import DP2LocalTapMaskBuilder, resolve_rsp_tap_token
 
     cfg = load_config(args.config)
     if args.output_dir:
         cfg.output.output_dir = str(args.output_dir)
     if args.token_file:
         cfg.access_token_file = str(args.token_file)
+
+    if bool(args.allow_synthetic_fallback) and resolve_rsp_tap_token(cfg.access_token_file) is None:
+        _adapt_cfg_for_synthetic_fallback(cfg)
 
     builder = DP2LocalTapMaskBuilder(
         cfg,

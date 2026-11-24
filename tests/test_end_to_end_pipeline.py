@@ -309,7 +309,10 @@ class TestEndToEndPipeline(unittest.TestCase):
 
         self.assertIn("mkp", ns)
         self.assertIn("summary", ns)
+        self.assertIn("wfd_summary", ns)
         self.assertIn("fig_ms", ns)
+        self.assertTrue(bool(ns["sky_ext"]["wide_survey"]))  # type: ignore[index]
+        self.assertEqual(int(ns["frac_map_order"]), 6)  # type: ignore[arg-type]
 
     def test_wide_wrap_survey_multiscale_visualizations(self) -> None:
         import healpy as hp

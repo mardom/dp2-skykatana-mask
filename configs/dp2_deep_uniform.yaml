@@ -65,6 +65,7 @@ monster_stars:
   max_radius_arcsec: 720.0
   enable_bleed_boxes: true
   bleed_mag_max: 12.0
+  bleed_pa_deg: 0.0          # Position angle [deg East of North] for bleed boxes
 
 galactic_mask:
   enabled: true
@@ -89,6 +90,6 @@ output:
   write_moc_fits: true
   moc_max_order: 13
   write_fracdet_map: true
-  fracdet_order: 10
+  fracdet_order: 6           # Coarse NSIDE=64 (~55' cells) for smooth survey fractional completeness
   n_random_points: 500000
   make_qa_plots: true

@@ -227,6 +227,70 @@ class TestConfigAndMemory(unittest.TestCase):
                     _maybe_reexec_with_rsp_lsst_distrib(None, "inspect-butler")
                     mock_execvp_2.assert_not_called()
 
+    def test_oriented_bleed_box_mask_and_script_runner(self) -> None:
+        from astropy.table import Table
+        import hpgeom as hpg
+        from skykatana import SkyMaskPipe
+
+        from dp2_skykatana_mask import build_oriented_bleed_box_mask, run_mask_script
+
+        bright_df = pd.DataFrame({"ra": [53.0], "dec": [-28.0], "mag": [9.0], "radius": [0.06]})
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_p = Path(tmp)
+            # Rotate bleed trail to PA = 35 deg East of North and verify pixelation along rotated axis
+            ms_rot = MonsterStarConfig(
+                enable_bleed_boxes=True,
+                bleed_width_factor=0.25,
+                bleed_height_factor=3.0,
+                bleed_pa_deg=35.0,
+            )
+            pipe_rot = SkyMaskPipe(order_out=13, order_cov=5)
+            fits_p = tmp_p / "rot_boxes.fits"
+            area_deg2 = build_oriented_bleed_box_mask(
+                pipe=pipe_rot,
+                bright_df=bright_df,
+                ms_cfg=ms_rot,
+                order_sparse=13,
+                order_cov=5,
+                n_threads=1,
+                boxes_fits_path=fits_p,
+                output_stage="boxmask",
+            )
+            self.assertGreater(area_deg2, 0.0)
+            bt = Table.read(str(fits_p), format="fits")
+            self.assertAlmostEqual(float(bt["pa_deg"][0]), 35.0, places=4)
+
+            # Tip along +35 deg East of North (d_length = +0.07 deg) must be masked,
+            # while orthogonal offset at -55 deg (d_perp = +0.07 deg > half-width 0.0075 deg) is unmasked!
+            pa_rad = math.radians(35.0)
+            cos_d = math.cos(math.radians(-28.0))
+            ra_along = 53.0 + (0.07 * math.sin(pa_rad)) / cos_d
+            dec_along = -28.0 + 0.07 * math.cos(pa_rad)
+            ra_perp = 53.0 + (0.07 * math.cos(pa_rad)) / cos_d
+            dec_perp = -28.0 - 0.07 * math.sin(pa_rad)
+            pix_check = hpg.angle_to_pixel(
+                1 << 13, [ra_along, ra_perp], [dec_along, dec_perp], nest=True, degrees=True
+            )
+            vals = pipe_rot.boxmask.get_values_pix(pix_check)
+            self.assertTrue(bool(vals[0]))
+            self.assertFalse(bool(vals[1]))
+
+            # Verify `run_mask_script` executes `run_local_tap_mask.sh` on full-DP2 config offline
+            wfd_out = tmp_p / "wfd_script_out"
+            with mock.patch.dict(
+                os.environ,
+                {"RSP_ACCESS_TOKEN": "", "ACCESS_TOKEN": "", "HOME": str(tmp_p)},
+                clear=False,
+            ):
+                summary = run_mask_script(
+                    REPO_ROOT / "scripts" / "run_local_tap_mask.sh",
+                    REPO_ROOT / "configs" / "dp2_wfd_default.yaml",
+                    output_dir=wfd_out,
+                    extra_args=["--allow-synthetic-fallback"],
+                )
+            self.assertGreater(float(summary["final_area_deg2"]), 1000.0)
+            self.assertTrue((wfd_out / "dp2_fracdet_o6.hs").is_file())
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -507,6 +507,85 @@ def _extract_columns_from_shard(
     return ra_deg, dec_deg, primary_mag, band_mags, flux_cols
 
 
+def build_oriented_bleed_box_mask(
+    pipe: SkyMaskPipe,
+    bright_df: pd.DataFrame,
+    ms_cfg: MonsterStarConfig,
+    order_sparse: int,
+    order_cov: int,
+    n_threads: int,
+    boxes_fits_path: Path,
+    output_stage: str = "boxmask",
+) -> float:
+    """Build a tangent-plane rectangular bleed-trail mask at arbitrary position angle ``bleed_pa_deg``.
+
+    Unlike upstream ``SkyMaskPipe.pixelate_boxes`` (which locks ``angle`` to 0 deg N-S or
+    90 deg E-W and multiplies the major semi-axis by ``cos(dec)`` even when oriented along
+    Declination), this helper computes exact 4-corner gnomonic sky coordinates rotated by
+    ``ms_cfg.bleed_pa_deg`` East of North (0 deg = North-South, 90 deg = East-West, or any
+    camera rotator ``skyRotation`` angle), writes both ``(ra_c, dec_c, width, height, pa_deg)``
+    and ``(ra0..ra3, dec0..dec3)`` to ``boxes_fits_path``, and pixelizes via
+    ``SkyMaskPipe.build_poly_mask`` into ``output_stage``.
+    """
+    ra_c = bright_df["ra"].to_numpy(dtype=np.float64) % 360.0
+    dec_c = bright_df["dec"].to_numpy(dtype=np.float64)
+    rad_deg = bright_df["radius"].to_numpy(dtype=np.float64)
+
+    width_deg = rad_deg * float(ms_cfg.bleed_width_factor)
+    height_deg = rad_deg * float(ms_cfg.bleed_height_factor)
+    pa_deg = float(ms_cfg.bleed_pa_deg)
+    pa_rad = math.radians(pa_deg)
+    sin_pa = math.sin(pa_rad)
+    cos_pa = math.cos(pa_rad)
+
+    hw = 0.5 * width_deg
+    hl = 0.5 * height_deg
+    cos_dec = np.maximum(np.cos(np.deg2rad(dec_c)), 0.05)
+
+    # Counter-clockwise corners in local (East, North) tangent plane:
+    # (-hw, -hl), (+hw, -hl), (+hw, +hl), (-hw, +hl) along (perp, long) axes
+    signs = ((-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0))
+    ra_corners: list[np.ndarray] = []
+    dec_corners: list[np.ndarray] = []
+    for sw, sl in signs:
+        d_east = sw * hw * cos_pa + sl * hl * sin_pa
+        d_north = -sw * hw * sin_pa + sl * hl * cos_pa
+        ra_corners.append((ra_c + d_east / cos_dec) % 360.0)
+        dec_corners.append(np.clip(dec_c + d_north, -89.99, 89.99))
+
+    boxes_tbl = Table(
+        {
+            "ra_c": ra_c,
+            "dec_c": dec_c,
+            "width": width_deg / cos_dec if abs(sin_pa) < 1e-6 else width_deg,
+            "height": height_deg,
+            "pa_deg": np.full(ra_c.shape, pa_deg, dtype=np.float64),
+            "ra0": ra_corners[0],
+            "ra1": ra_corners[1],
+            "ra2": ra_corners[2],
+            "ra3": ra_corners[3],
+            "dec0": dec_corners[0],
+            "dec1": dec_corners[1],
+            "dec2": dec_corners[2],
+            "dec3": dec_corners[3],
+        }
+    )
+    boxes_tbl.write(boxes_fits_path, format="fits", overwrite=True)
+
+    poly_cols = ["ra0", "ra1", "ra2", "ra3", "dec0", "dec1", "dec2", "dec3"]
+    boxmask = pipe.build_poly_mask(
+        data=boxes_fits_path,
+        order_sparse=int(order_sparse),
+        order_cov=int(order_cov),
+        fmt="fits",
+        columns=poly_cols,
+        bit_packed=True,
+        n_threads=int(n_threads),
+        output_stage=output_stage,
+    )
+    return float(boxmask.get_valid_area(degrees=True))
+
+
 def build_monster_star_mask(
     pipe: SkyMaskPipe,
     butler: Any,
@@ -711,33 +790,18 @@ def build_monster_star_mask(
         bright_df = bright_df[bright_df["mag"] <= float(ms_cfg.bleed_mag_max)].reset_index(drop=True)
         n_bleed_boxes = len(bright_df)
         if n_bleed_boxes > 0:
-            # Note: SkyMaskPipe.pixelate_boxes accesses `table[coldec].value`, which requires an
-            # Astropy Table (via file path) rather than a pandas Series.
             boxes_fits_path = work_dir / "monster_bleed_boxes.fits"
-            boxes_tbl = Table(
-                {
-                    "ra_c": bright_df["ra"].to_numpy(dtype=np.float64),
-                    "dec_c": bright_df["dec"].to_numpy(dtype=np.float64),
-                    "width": bright_df["radius"].to_numpy(dtype=np.float64)
-                    * float(ms_cfg.bleed_width_factor),
-                    "height": bright_df["radius"].to_numpy(dtype=np.float64)
-                    * float(ms_cfg.bleed_height_factor),
-                }
-            )
-            del bright_df
-            boxes_tbl.write(boxes_fits_path, format="fits", overwrite=True)
-            del boxes_tbl
-            boxmask = pipe.build_box_mask(
-                data=boxes_fits_path,
+            boxmask_area_deg2 = build_oriented_bleed_box_mask(
+                pipe=pipe,
+                bright_df=bright_df,
+                ms_cfg=ms_cfg,
                 order_sparse=order_star,
                 order_cov=order_cov,
-                fmt="fits",
-                columns=["ra_c", "dec_c", "width", "height"],
-                bit_packed=True,
                 n_threads=int(cfg.memory.skykatana_threads),
+                boxes_fits_path=boxes_fits_path,
                 output_stage=box_stage,
             )
-            boxmask_area_deg2 = float(boxmask.get_valid_area(degrees=True))
+            del bright_df
             if not ms_cfg.save_star_circles_parquet and boxes_fits_path.exists():
                 boxes_fits_path.unlink()
             gc.collect()

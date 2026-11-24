@@ -77,6 +77,7 @@ monster_stars:
   bleed_mag_max: 11.5
   bleed_width_factor: 0.25
   bleed_height_factor: 2.5
+  bleed_pa_deg: 0.0          # Position angle [deg East of North]; 0=N-S, 90=E-W, or custom rotator PA
   save_star_circles_parquet: true
 
 galactic_mask:
@@ -98,6 +99,6 @@ output:
   write_moc_fits: true
   moc_max_order: 14
   write_fracdet_map: true
-  fracdet_order: 10
+  fracdet_order: 8
   n_random_points: 100000
   make_qa_plots: true

@@ -30,6 +30,7 @@ from .monster_stars import (
     AB_MAG_ZEROPOINT_NJY,
     build_monster_hats_star_mask_online,
     build_monster_star_mask,
+    build_oriented_bleed_box_mask,
     flux_njy_to_abmag,
     make_skykatana_radfunction,
     skykatana_lsst_radfunction,
@@ -58,6 +59,7 @@ from .visualization import (
     plot_complete_mask_allsky,
     plot_complete_mask_fracmap,
     plot_complete_mask_multiscale,
+    run_mask_script,
     select_dense_zoom_box,
 )
 
@@ -92,6 +94,7 @@ __all__ = [
     "build_local_tap_star_mask",
     "build_monster_hats_star_mask_online",
     "build_monster_star_mask",
+    "build_oriented_bleed_box_mask",
     "build_tap_ebv_provider",
     "build_tap_property_mask",
     "compute_band_extinction_mag",
@@ -110,6 +113,7 @@ __all__ = [
     "plot_complete_mask_fracmap",
     "plot_complete_mask_multiscale",
     "resolve_rsp_tap_token",
+    "run_mask_script",
     "select_dense_zoom_box",
     "skykatana_lsst_radfunction",
 ]

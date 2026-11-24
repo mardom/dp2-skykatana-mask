@@ -166,17 +166,25 @@ class TestLocalTapPipeline(unittest.TestCase):
         plt.show = lambda *args, **kwargs: None
         try:
             os.chdir(REPO_ROOT)
-            with mock.patch.dict(os.environ, {"RSP_ACCESS_TOKEN": "", "ACCESS_TOKEN": ""}, clear=False):
-                with mock.patch("pathlib.Path.home", return_value=Path("/nonexistent_home_for_test")):
-                    for idx, cell in enumerate(code_cells):
-                        src = "".join(cell.get("source", []))
-                        exec(compile(src, f"{nb_path.name}#cell-{idx}-{cell.get('id')}", "exec"), ns)
-                        plt.close("all")
+            with tempfile.TemporaryDirectory() as fake_home:
+                with mock.patch.dict(
+                    os.environ,
+                    {"RSP_ACCESS_TOKEN": "", "ACCESS_TOKEN": "", "HOME": fake_home},
+                    clear=False,
+                ):
+                    with mock.patch("pathlib.Path.home", return_value=Path(fake_home)):
+                        for idx, cell in enumerate(code_cells):
+                            src = "".join(cell.get("source", []))
+                            exec(compile(src, f"{nb_path.name}#cell-{idx}-{cell.get('id')}", "exec"), ns)
+                            plt.close("all")
 
             self.assertIn("mkp", ns)
             self.assertIn("auto_pipe", ns)
             self.assertIn("summary", ns)
+            self.assertIn("wfd_summary", ns)
             self.assertIn("fig_ms", ns)
+            self.assertTrue(bool(ns["sky_ext"]["wide_survey"]))  # type: ignore[index]
+            self.assertEqual(int(ns["frac_map_order"]), 6)  # type: ignore[arg-type]
             self.assertGreater(float(ns["delta_area"]), 0.0)  # type: ignore[arg-type]
 
             clean_gal = ns["clean_galaxies"]
