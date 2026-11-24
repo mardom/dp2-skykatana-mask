@@ -357,6 +357,84 @@ class TestEndToEndPipeline(unittest.TestCase):
         fig3, _, _ = plot_complete_mask_allsky(pipe, show=False)
         plt.close(fig3)
 
+    def test_qa_plot_preserves_backend_and_agg_notebook_fallback_displays_inline(self) -> None:
+        import sys
+        import warnings
+        from unittest import mock
+
+        from dp2_skykatana_mask.pipeline import MaskBuildSummary, _render_qa_plot
+        from dp2_skykatana_mask.property_mask import PropertyMaskStats
+        from dp2_skykatana_mask.visualization import _show_figure_safely
+
+        # 1. Verify _render_qa_plot never calls matplotlib.use(...) to clobber active backend
+        pipe = SkyMaskPipe(order_out=10, order_cov=5)
+        pipe.propmask = hsp.HealSparseMap.make_empty(32, 1024, dtype=np.bool_, bit_packed=True)
+        pipe.propmask.update_values_pix(np.arange(100, 140, dtype=np.int64), True)
+        pipe.mask = pipe.propmask
+
+        dummy_summary = MaskBuildSummary(
+            butler_repo="dp2",
+            butler_collections=["dp2"],
+            region_mode="cone",
+            order_out=10,
+            order_cov=5,
+            nside_out=1024,
+            property_mask=PropertyMaskStats(
+                order_sparse=10,
+                order_cov=5,
+                nside_sparse=1024,
+                nside_cov=32,
+                bands_evaluated=["r"],
+                min_filters=1,
+                required_bands=["r"],
+                n_cov_pixels_scanned=1,
+                n_valid_pixels=40,
+                area_deg2=0.1,
+                per_band_area_deg2={"r": 0.1},
+            ),
+            dust_mask=None,
+            monster_stars=None,
+            mwmask_area_deg2=0.0,
+            positive_stages=["propmask"],
+            negative_stages=[],
+            final_valid_pixels=40,
+            final_area_deg2=0.1,
+            footprint_retained_fraction=1.0,
+            full_sky_fraction=2e-6,
+            peak_ram_gib=0.3,
+            memory_limit_gib=32.0,
+            memory_limit_source="config",
+            elapsed_seconds=0.1,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch("matplotlib.use") as mock_use:
+                _render_qa_plot(pipe, dummy_summary, Path(tmp) / "qa.png")
+                mock_use.assert_not_called()
+
+        # 2. Verify _show_figure_safely renders inline via IPython.display with ZERO FigureCanvasAgg
+        #    UserWarning even if a notebook session is stuck on the non-interactive 'Agg' backend!
+        fake_shell = mock.MagicMock()
+        fake_shell.kernel = object()
+        fake_ip_mod = mock.MagicMock()
+        fake_ip_mod.get_ipython.return_value = fake_shell
+        displayed_items: list[object] = []
+        fake_display_mod = mock.MagicMock()
+        fake_display_mod.Image = lambda data: ("PNG", len(data))
+        fake_display_mod.display = lambda obj: displayed_items.append(obj)
+
+        fig_test, ax_test = plt.subplots(figsize=(3, 2))
+        ax_test.plot([0, 1], [0, 1])
+        with mock.patch.dict(
+            sys.modules,
+            {"IPython": fake_ip_mod, "IPython.display": fake_display_mod},
+        ):
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                _show_figure_safely(fig_test)
+            agg_warnings = [w for w in caught if "FigureCanvasAgg" in str(w.message)]
+            self.assertEqual(len(agg_warnings), 0)
+            self.assertEqual(len(displayed_items), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

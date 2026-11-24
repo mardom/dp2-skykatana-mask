@@ -43,6 +43,39 @@ from mocpy import WCS as MocWCS
 from skykatana import SkyMaskPipe
 
 
+def _show_figure_safely(fig: plt.Figure) -> None:
+    """Display ``fig`` inline in Jupyter/IPython notebooks (even if an earlier call or
+    environment variable set ``MPLBACKEND=Agg``) without ``FigureCanvasAgg`` warnings."""
+    import io
+    import sys
+
+    import matplotlib
+
+    ip_mod = sys.modules.get("IPython")
+    shell = (
+        ip_mod.get_ipython()
+        if (ip_mod is not None and hasattr(ip_mod, "get_ipython"))
+        else None
+    )
+    in_notebook_kernel = shell is not None and hasattr(shell, "kernel")
+    backend_low = str(matplotlib.get_backend()).lower()
+
+    if in_notebook_kernel and backend_low == "agg":
+        try:
+            shell.run_line_magic("matplotlib", "inline")
+        except Exception:
+            pass
+        from IPython.display import Image, display
+
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png", dpi=145, bbox_inches="tight")
+        display(Image(data=buf.getvalue()))
+        plt.close(fig)
+        return
+
+    plt.show()
+
+
 def compute_sky_extent(
     pipe: SkyMaskPipe,
     stage: str = "mask",
@@ -453,7 +486,7 @@ def plot_complete_mask_multiscale(
     if save_path is not None:
         fig.savefig(save_path, dpi=150, bbox_inches="tight")
     if show:
-        plt.show()
+        _show_figure_safely(fig)
     return fig, (ax_ov, ax_zm)
 
 
@@ -509,7 +542,7 @@ def plot_complete_mask_fracmap(
     if save_path is not None:
         fig.savefig(save_path, dpi=150, bbox_inches="tight")
     if show:
-        plt.show()
+        _show_figure_safely(fig)
     return fig, ax, wcs
 
 
@@ -618,5 +651,5 @@ def plot_complete_mask_allsky(
     if save_path is not None:
         fig.savefig(save_path, dpi=150, bbox_inches="tight")
     if show:
-        plt.show()
+        _show_figure_safely(fig)
     return fig, ax, wcs

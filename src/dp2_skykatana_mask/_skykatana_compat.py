@@ -299,7 +299,9 @@ def apply_skykatana_runtime_fixes() -> None:
                     )
 
             if show:
-                plt.show()
+                from .visualization import _show_figure_safely
+
+                _show_figure_safely(fig)
             return fig, ax, wcs
 
         SkyMaskPipe.plot_moc = _streaming_plot_moc  # type: ignore[method-assign]

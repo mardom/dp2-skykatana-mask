@@ -255,30 +255,31 @@ class DP2MaskBuilder:
         )
 
         if self.cfg.output.make_qa_plots:
-            qa_path = out_dir / "dp2_mask_qa.png"
-            _render_qa_plot(self.pipe, summary, qa_path)
-            summary.output_files["qa_plot_png"] = str(qa_path)
-            if self.pipe.mask is not None and int(self.pipe.mask.n_valid) > 0:
-                import matplotlib.pyplot as plt
+            import matplotlib.pyplot as plt
 
-                from .visualization import plot_complete_mask_multiscale
+            from .visualization import plot_complete_mask_multiscale
 
-                circ_p = (
-                    summary.monster_stars.circles_parquet_path
-                    if summary.monster_stars is not None
-                    else None
-                )
-                box_p = out_dir / "monster_bleed_boxes.fits"
-                ms_path = out_dir / "dp2_complete_mask_multiscale.png"
-                fig_ms, _ = plot_complete_mask_multiscale(
-                    self.pipe,
-                    circles_path=circ_p,
-                    boxes_path=box_p if box_p.is_file() else None,
-                    show=False,
-                    save_path=ms_path,
-                )
-                plt.close(fig_ms)
-                summary.output_files["complete_mask_multiscale_png"] = str(ms_path)
+            with plt.ioff():
+                qa_path = out_dir / "dp2_mask_qa.png"
+                _render_qa_plot(self.pipe, summary, qa_path)
+                summary.output_files["qa_plot_png"] = str(qa_path)
+                if self.pipe.mask is not None and int(self.pipe.mask.n_valid) > 0:
+                    circ_p = (
+                        summary.monster_stars.circles_parquet_path
+                        if summary.monster_stars is not None
+                        else None
+                    )
+                    box_p = out_dir / "monster_bleed_boxes.fits"
+                    ms_path = out_dir / "dp2_complete_mask_multiscale.png"
+                    fig_ms, _ = plot_complete_mask_multiscale(
+                        self.pipe,
+                        circles_path=circ_p,
+                        boxes_path=box_p if box_p.is_file() else None,
+                        show=False,
+                        save_path=ms_path,
+                    )
+                    plt.close(fig_ms)
+                    summary.output_files["complete_mask_multiscale_png"] = str(ms_path)
 
         summary_path = summary.write_json(out_dir / "mask_build_summary.json")
         summary.output_files["summary_json"] = str(summary_path)
@@ -349,13 +350,11 @@ class DP2MaskBuilder:
 
 
 def _render_qa_plot(pipe: SkyMaskPipe, summary: MaskBuildSummary, out_path: Path) -> None:
-    """Render a lightweight headless QA figure without materializing full-resolution pixel arrays."""
-    import matplotlib
-
-    matplotlib.use("Agg", force=False)
+    """Render a lightweight QA figure to disk without altering Matplotlib's active backend."""
     import matplotlib.pyplot as plt
 
-    fig, axes = plt.subplots(1, 2, figsize=(12, 4.8), constrained_layout=True)
+    with plt.ioff():
+        fig, axes = plt.subplots(1, 2, figsize=(12, 4.8), constrained_layout=True)
 
     # Panel 1: Per-band & combined area bar chart
     ax0 = axes[0]
