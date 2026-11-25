@@ -48,6 +48,7 @@ import re
 import time
 import urllib.parse
 import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping, Sequence
@@ -161,9 +162,11 @@ class IVOATapClient:
         self.tap_url = tap_url.rstrip("/")
         self.timeout_sec = float(timeout_sec)
         self.is_synthetic = False
+        self._token = token.strip() if token else None
+        self._prefer_pyvo = bool(prefer_pyvo)
         self._session = requests.Session()
-        if token:
-            self._session.headers["Authorization"] = f"Bearer {token.strip()}"
+        if self._token:
+            self._session.headers["Authorization"] = f"Bearer {self._token}"
 
         self.pyvo_service: Any | None = None
         if prefer_pyvo:
@@ -173,6 +176,15 @@ class IVOATapClient:
                 self.pyvo_service = pyvo.dal.TAPService(self.tap_url, session=self._session)
             except ImportError:
                 self.pyvo_service = None
+
+    def clone_for_thread(self) -> "IVOATapClient":
+        """Create an independent HTTP session instance safe for concurrent worker threads."""
+        return IVOATapClient(
+            tap_url=self.tap_url,
+            token=self._token,
+            timeout_sec=self.timeout_sec,
+            prefer_pyvo=self._prefer_pyvo,
+        )
 
     @property
     def backend_name(self) -> str:
@@ -754,15 +766,15 @@ def _plan_full_dp2_ra_stripes(
     tap_client: IVOATapClient | "SyntheticDP2TapService",
     sinfo: TapSchemaInfo,
     bands: Sequence[str],
-    target_visits_per_stripe: int = 1_200,
+    target_visits_per_stripe: int = 3_400,
 ) -> list[tuple[float, float]]:
     """Query lightweight ``dp2.Visit.ra`` once to build visit-balanced RA stripes across ``[0, 360)``.
 
     Skips completely empty RA intervals and automatically subdivides ultra-dense Galactic
-    Bulge / WFD zones (such as ``RA = [270, 300)``) into narrow stripes of ~1,200 visits
-    (~225k CCD rows) so every UWS ``/async`` query completes quickly and well below ``MAXREC``.
+    Bulge / WFD zones (such as ``RA = [270, 300)``) into balanced stripes (~600k CCD rows)
+    well below ``MAXREC`` so concurrent UWS ``/async`` jobs complete in ~2 minutes total.
     """
-    default_stripes = [(float(lo), float(lo + 15.0)) for lo in range(0, 360, 15)]
+    default_stripes = [(float(lo), float(lo + 30.0)) for lo in range(0, 360, 30)]
     if getattr(tap_client, "is_synthetic", False):
         return [(0.0, 360.0)]
 
@@ -848,45 +860,60 @@ def _iter_visit_detector_tables(
             yield tbl.to_pandas()
         return
 
-    stripe_maxrec = 1_000_000
+    stripe_maxrec = 1_500_000
     queue = list(_plan_full_dp2_ra_stripes(tap_client, sinfo, bands))
     total_initial = len(queue)
     done_idx = 0
-    while queue:
-        ra_lo, ra_hi = queue.pop(0)
-        done_idx += 1
-        adql = (
+    max_parallel = 3 if hasattr(tap_client, "clone_for_thread") else 1
+
+    def _query_one_stripe(bounds: tuple[float, float]) -> tuple[float, float, Table]:
+        r_lo, r_hi = bounds
+        worker_client = (
+            tap_client.clone_for_thread()
+            if hasattr(tap_client, "clone_for_thread")
+            else tap_client
+        )
+        q_adql = (
             f"{select_cols} "
             f"WHERE {band_expr} IN ({bands_csv}) "
-            f"AND (vd.ra >= {ra_lo:.5f} AND vd.ra < {ra_hi:.5f})"
+            f"AND (vd.ra >= {r_lo:.5f} AND vd.ra < {r_hi:.5f})"
         )
+        res_t = worker_client.search(q_adql, maxrec=stripe_maxrec, async_query=True).to_table()
+        return r_lo, r_hi, res_t
+
+    while queue:
+        batch_bounds = [queue.pop(0) for _ in range(min(max_parallel, len(queue)))]
         logger.info(
-            "Querying full-DP2 TAP %s stripe %d/%d: RA=[%.2f, %.2f) deg (UWS /async) ...",
+            "Submitting %d concurrent UWS /async %s stripe(s): %s (completed %d/%d) ...",
+            len(batch_bounds),
             sinfo.visit_detector_table,
+            ", ".join(f"[{a:.1f}, {b:.1f})" for a, b in batch_bounds),
             done_idx,
-            max(done_idx + len(queue), total_initial),
-            ra_lo,
-            ra_hi,
+            max(done_idx + len(batch_bounds) + len(queue), total_initial),
         )
-        tbl = tap_client.search(adql, maxrec=stripe_maxrec, async_query=True).to_table()
-        if len(tbl) >= stripe_maxrec and (ra_hi - ra_lo) > 0.05:
-            ra_mid = 0.5 * (ra_lo + ra_hi)
-            logger.warning(
-                "Stripe RA=[%.2f, %.2f) hit MAXREC=%d; bisecting into [%.2f, %.2f) and [%.2f, %.2f)!",
-                ra_lo,
-                ra_hi,
-                stripe_maxrec,
-                ra_lo,
-                ra_mid,
-                ra_mid,
-                ra_hi,
-            )
-            queue.insert(0, (ra_mid, ra_hi))
-            queue.insert(0, (ra_lo, ra_mid))
-            continue
-        if len(tbl) > 0:
-            yield tbl.to_pandas()
-        del tbl
+        with ThreadPoolExecutor(max_workers=len(batch_bounds)) as pool:
+            results = list(pool.map(_query_one_stripe, batch_bounds))
+
+        for ra_lo, ra_hi, tbl in results:
+            done_idx += 1
+            if len(tbl) >= stripe_maxrec and (ra_hi - ra_lo) > 0.05:
+                ra_mid = 0.5 * (ra_lo + ra_hi)
+                logger.warning(
+                    "Stripe RA=[%.2f, %.2f) hit MAXREC=%d; bisecting into [%.2f, %.2f) and [%.2f, %.2f)!",
+                    ra_lo,
+                    ra_hi,
+                    stripe_maxrec,
+                    ra_lo,
+                    ra_mid,
+                    ra_mid,
+                    ra_hi,
+                )
+                queue.insert(0, (ra_mid, ra_hi))
+                queue.insert(0, (ra_lo, ra_mid))
+                continue
+            if len(tbl) > 0:
+                yield tbl.to_pandas()
+            del tbl
 
 
 def build_tap_property_mask(
@@ -1318,7 +1345,7 @@ def _compute_star_query_clauses(
         if c_ra.size == 0:
             return []
 
-    nside_cone = 8  # 768 sky cells across 4pi; max corner radius ~ 5.8 deg (~108 deg^2/cone)
+    nside_cone = 8  # order=3 (768 sky cells across 4pi; max corner radius ~ 5.8 deg, ~108 deg^2/cone)
     cone_ids = np.unique(hpg.angle_to_pixel(nside_cone, c_ra, c_dec, nest=True, degrees=True))
     q_ra, q_dec = hpg.pixel_to_angle(nside_cone, cone_ids, nest=True, degrees=True)
     cone_rad = float(hpg.max_pixel_radius(nside_cone, degrees=True)) + 0.35 + float(buffer_deg)
@@ -1387,119 +1414,157 @@ def build_local_tap_star_mask(
     star_source = "gaia_dr3_tap"
     flux_cols_used = ["phot_g_mean_mag", "bp_rp -> synthetic_lsst_ugrizy"]
 
+    def _fetch_star_cone(
+        item: tuple[int, str],
+    ) -> tuple[np.ndarray, np.ndarray, dict[str, np.ndarray], str, list[str]]:
+        idx_c, where_clause = item
+        adql_gaia = (
+            f"SELECT ra, dec, phot_g_mean_mag, bp_rp "
+            f"FROM gaiadr3.gaia_source "
+            f"WHERE ({where_clause}) AND phot_g_mean_mag <= {g_cut:.3f}"
+        )
+        g_worker = (
+            gaia_tap_client.clone_for_thread()
+            if hasattr(gaia_tap_client, "clone_for_thread")
+            else gaia_tap_client
+        )
+        try:
+            g_tbl = None
+            last_gaia_err: Exception | None = None
+            for attempt in range(3):
+                try:
+                    g_tbl = g_worker.search(
+                        adql_gaia,
+                        maxrec=1_500_000,
+                        async_query=(
+                            attempt >= 1 and not getattr(g_worker, "is_synthetic", False)
+                        ),
+                    ).to_table()
+                    break
+                except Exception as g_exc:
+                    last_gaia_err = g_exc
+                    if getattr(g_worker, "is_synthetic", False):
+                        raise
+                    time.sleep(1.0 * (attempt + 1))
+            if g_tbl is None:
+                assert last_gaia_err is not None
+                raise last_gaia_err
+            ra_d = np.asarray(g_tbl["ra"], dtype=np.float64) % 360.0
+            dec_d = np.asarray(g_tbl["dec"], dtype=np.float64)
+            g_m = np.asarray(g_tbl["phot_g_mean_mag"], dtype=np.float64)
+            bp_rp_arr = np.asarray(g_tbl["bp_rp"], dtype=np.float64)
+            return (
+                ra_d,
+                dec_d,
+                gaia_to_synthetic_lsst_magnitudes(g_m, bp_rp_arr),
+                "gaia_dr3_tap",
+                ["phot_g_mean_mag", "bp_rp -> synthetic_lsst_ugrizy"],
+            )
+        except Exception as exc:
+            if rsp_tap_client is None:
+                raise
+            logger.warning(
+                "Public Gaia DR3 TAP unreachable on chunk %d/%d (%s); falling back to RSP TAP Object.",
+                idx_c + 1,
+                len(clauses),
+                exc,
+            )
+            r_worker = (
+                rsp_tap_client.clone_for_thread()
+                if hasattr(rsp_tap_client, "clone_for_thread")
+                else rsp_tap_client
+            )
+            sinfo = discover_dp2_tap_schema(r_worker)
+            where_obj = where_clause.replace("ra,", "coord_ra,").replace("dec)", "coord_dec)")
+            adql_obj = (
+                f"SELECT coord_ra AS ra, coord_dec AS dec, g_psfMag, r_psfMag, i_psfMag "
+                f"FROM {sinfo.object_table} "
+                f"WHERE ({where_obj}) AND refExtendedness = 0 AND r_psfMag <= {float(ms_cfg.mag_max):.3f}"
+            )
+            o_tbl = r_worker.search(adql_obj, maxrec=500_000).to_table()
+            ra_d = np.asarray(o_tbl["ra"], dtype=np.float64) % 360.0
+            dec_d = np.asarray(o_tbl["dec"], dtype=np.float64)
+            synth = {
+                "lsst_g_mag": np.asarray(o_tbl["g_psfMag"], dtype=np.float64),
+                "lsst_r_mag": np.asarray(o_tbl["r_psfMag"], dtype=np.float64),
+                "lsst_i_mag": np.asarray(o_tbl["i_psfMag"], dtype=np.float64),
+            }
+            return ra_d, dec_d, synth, f"rsp_tap:{sinfo.object_table}", ["g_psfMag", "r_psfMag", "i_psfMag"]
+
+    star_workers = (
+        4
+        if (len(clauses) > 1 and not getattr(gaia_tap_client, "is_synthetic", False))
+        else 1
+    )
+    indexed_clauses = list(enumerate(clauses))
+
     try:
-        for idx_c, where_clause in enumerate(clauses):
-            adql_gaia = (
-                f"SELECT ra, dec, phot_g_mean_mag, bp_rp "
-                f"FROM gaiadr3.gaia_source "
-                f"WHERE ({where_clause}) AND phot_g_mean_mag <= {g_cut:.3f}"
-            )
-            try:
-                g_tbl = None
-                last_gaia_err: Exception | None = None
-                for attempt in range(3):
-                    try:
-                        g_tbl = gaia_tap_client.search(
-                            adql_gaia,
-                            maxrec=1_500_000,
-                            async_query=(attempt >= 1 and not getattr(gaia_tap_client, "is_synthetic", False)),
-                        ).to_table()
-                        break
-                    except Exception as g_exc:
-                        last_gaia_err = g_exc
-                        if getattr(gaia_tap_client, "is_synthetic", False):
-                            raise
-                        time.sleep(1.0 * (attempt + 1))
-                if g_tbl is None:
-                    assert last_gaia_err is not None
-                    raise last_gaia_err
-                ra_deg = np.asarray(g_tbl["ra"], dtype=np.float64) % 360.0
-                dec_deg = np.asarray(g_tbl["dec"], dtype=np.float64)
-                g_mag = np.asarray(g_tbl["phot_g_mean_mag"], dtype=np.float64)
-                bp_rp = np.asarray(g_tbl["bp_rp"], dtype=np.float64)
-                synth_lsst = gaia_to_synthetic_lsst_magnitudes(g_mag, bp_rp)
-            except Exception as exc:
-                if rsp_tap_client is None:
-                    raise
-                logger.warning(
-                    "Public Gaia DR3 TAP unreachable on chunk %d/%d (%s); falling back to RSP TAP Object.",
-                    idx_c + 1,
-                    len(clauses),
-                    exc,
+        for w_start in range(0, len(indexed_clauses), star_workers):
+            wave_items = indexed_clauses[w_start : w_start + star_workers]
+            if star_workers > 1 and len(wave_items) > 1:
+                with ThreadPoolExecutor(max_workers=len(wave_items)) as pool:
+                    wave_res = list(pool.map(_fetch_star_cone, wave_items))
+            else:
+                wave_res = [_fetch_star_cone(it) for it in wave_items]
+
+            for ra_deg, dec_deg, synth_lsst, src_used, cols_used in wave_res:
+                star_source = src_used
+                flux_cols_used = cols_used
+                if ra_deg.size == 0:
+                    continue
+
+                primary_mag = synth_lsst.get(f"lsst_{target_band}_mag", synth_lsst["lsst_r_mag"])
+                keep = (
+                    np.isfinite(ra_deg)
+                    & np.isfinite(dec_deg)
+                    & np.isfinite(primary_mag)
+                    & (primary_mag >= float(ms_cfg.mag_min))
+                    & (primary_mag <= float(ms_cfg.mag_max))
                 )
-                sinfo = discover_dp2_tap_schema(rsp_tap_client)
-                where_obj = where_clause.replace("ra,", "coord_ra,").replace("dec)", "coord_dec)")
-                adql_obj = (
-                    f"SELECT coord_ra AS ra, coord_dec AS dec, g_psfMag, r_psfMag, i_psfMag "
-                    f"FROM {sinfo.object_table} "
-                    f"WHERE ({where_obj}) AND refExtendedness = 0 AND r_psfMag <= {float(ms_cfg.mag_max):.3f}"
-                )
-                o_tbl = rsp_tap_client.search(adql_obj, maxrec=500_000).to_table()
-                ra_deg = np.asarray(o_tbl["ra"], dtype=np.float64) % 360.0
-                dec_deg = np.asarray(o_tbl["dec"], dtype=np.float64)
-                synth_lsst = {
-                    "lsst_g_mag": np.asarray(o_tbl["g_psfMag"], dtype=np.float64),
-                    "lsst_r_mag": np.asarray(o_tbl["r_psfMag"], dtype=np.float64),
-                    "lsst_i_mag": np.asarray(o_tbl["i_psfMag"], dtype=np.float64),
-                }
-                star_source = f"rsp_tap:{sinfo.object_table}"
-                flux_cols_used = ["g_psfMag", "r_psfMag", "i_psfMag"]
+                if not np.any(keep):
+                    continue
 
-            if ra_deg.size == 0:
-                continue
-
-            primary_mag = synth_lsst.get(f"lsst_{target_band}_mag", synth_lsst["lsst_r_mag"])
-            keep = (
-                np.isfinite(ra_deg)
-                & np.isfinite(dec_deg)
-                & np.isfinite(primary_mag)
-                & (primary_mag >= float(ms_cfg.mag_min))
-                & (primary_mag <= float(ms_cfg.mag_max))
-            )
-            if not np.any(keep):
-                continue
-
-            p128 = hpg.angle_to_pixel(128, ra_deg[keep], dec_deg[keep], nest=True, degrees=True)
-            in_foot = dilated_128[p128]
-            idx_sel = np.flatnonzero(keep)[in_foot]
-            if idx_sel.size == 0:
-                continue
-
-            # Deduplicate overlapping cones via sub-arcsecond HEALPix nside=2^20 key
-            if len(clauses) > 1:
-                hp_keys = hpg.angle_to_pixel(
-                    1 << 20, ra_deg[idx_sel], dec_deg[idx_sel], nest=True, degrees=True
-                )
-                uniq_mask = np.array([int(k) not in seen_keys for k in hp_keys], dtype=bool)
-                for k in hp_keys[uniq_mask]:
-                    seen_keys.add(int(k))
-                idx_sel = idx_sel[uniq_mask]
+                p128 = hpg.angle_to_pixel(128, ra_deg[keep], dec_deg[keep], nest=True, degrees=True)
+                in_foot = dilated_128[p128]
+                idx_sel = np.flatnonzero(keep)[in_foot]
                 if idx_sel.size == 0:
                     continue
 
-            cols_df: dict[str, np.ndarray] = {
-                "ra": ra_deg[idx_sel],
-                "dec": dec_deg[idx_sel],
-                "mag": primary_mag[idx_sel],
-            }
-            for k_name, arr in synth_lsst.items():
-                cols_df[k_name] = arr[idx_sel]
-            chunk_df = pd.DataFrame(cols_df)
-            active_radfn(chunk_df)
+                # Deduplicate overlapping cones via sub-arcsecond HEALPix nside=2^20 key
+                if len(clauses) > 1:
+                    hp_keys = hpg.angle_to_pixel(
+                        1 << 20, ra_deg[idx_sel], dec_deg[idx_sel], nest=True, degrees=True
+                    )
+                    uniq_mask = np.array([int(k) not in seen_keys for k in hp_keys], dtype=bool)
+                    for k in hp_keys[uniq_mask]:
+                        seen_keys.add(int(k))
+                    idx_sel = idx_sel[uniq_mask]
+                    if idx_sel.size == 0:
+                        continue
 
-            writer.write_table(
-                pa.Table.from_arrays(
-                    [
-                        pa.array(chunk_df["ra"].to_numpy(dtype=np.float64), type=pa.float64()),
-                        pa.array(chunk_df["dec"].to_numpy(dtype=np.float64), type=pa.float64()),
-                        pa.array(chunk_df["mag"].to_numpy(dtype=np.float32), type=pa.float32()),
-                        pa.array(chunk_df["radius"].to_numpy(dtype=np.float32), type=pa.float32()),
-                    ],
-                    schema=arrow_schema,
+                cols_df: dict[str, np.ndarray] = {
+                    "ra": ra_deg[idx_sel],
+                    "dec": dec_deg[idx_sel],
+                    "mag": primary_mag[idx_sel],
+                }
+                for k_name, arr in synth_lsst.items():
+                    cols_df[k_name] = arr[idx_sel]
+                chunk_df = pd.DataFrame(cols_df)
+                active_radfn(chunk_df)
+
+                writer.write_table(
+                    pa.Table.from_arrays(
+                        [
+                            pa.array(chunk_df["ra"].to_numpy(dtype=np.float64), type=pa.float64()),
+                            pa.array(chunk_df["dec"].to_numpy(dtype=np.float64), type=pa.float64()),
+                            pa.array(chunk_df["mag"].to_numpy(dtype=np.float32), type=pa.float32()),
+                            pa.array(chunk_df["radius"].to_numpy(dtype=np.float32), type=pa.float32()),
+                        ],
+                        schema=arrow_schema,
+                    )
                 )
-            )
-            total_stars += len(chunk_df)
-            del chunk_df, cols_df
+                total_stars += len(chunk_df)
+                del chunk_df, cols_df
     finally:
         writer.close()
 
