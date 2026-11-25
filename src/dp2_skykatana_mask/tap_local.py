@@ -46,10 +46,11 @@ import math
 import os
 import re
 import time
+import urllib.parse
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any, Callable, Iterator, Mapping, Sequence
 
 import healsparse as hsp
 import hpgeom as hpg
@@ -184,7 +185,11 @@ class IVOATapClient:
         maxrec: int | None = 500_000,
         async_query: bool = False,
     ) -> TapQueryResult:
-        """Execute an ADQL query synchronously or asynchronously and return a ``TapQueryResult``."""
+        """Execute an ADQL query synchronously or asynchronously and return a ``TapQueryResult``.
+
+        Automatically promotes synchronous queries that hit a server-side synchronous
+        execution timeout (`Query timeout exceeded` / HTTP 504 / ReadTimeout) to UWS `/async`.
+        """
         if self.pyvo_service is not None:
             if async_query:
                 job = self.pyvo_service.submit_job(adql, maxrec=maxrec)
@@ -192,11 +197,35 @@ class IVOATapClient:
                 job.wait(phases=["COMPLETED", "ERROR", "ABORTED"])
                 job.raise_if_error()
                 return TapQueryResult(job.fetch_result().to_table())
-            return TapQueryResult(self.pyvo_service.search(adql, maxrec=maxrec).to_table())
+            try:
+                return TapQueryResult(self.pyvo_service.search(adql, maxrec=maxrec).to_table())
+            except Exception as exc:
+                msg = str(exc).lower()
+                if "timeout" in msg or "/async" in msg or "504" in msg:
+                    logger.info("Sync TAP query timed out; promoting automatically to UWS /async ...")
+                    job = self.pyvo_service.submit_job(adql, maxrec=maxrec)
+                    job.run()
+                    job.wait(phases=["COMPLETED", "ERROR", "ABORTED"])
+                    job.raise_if_error()
+                    return TapQueryResult(job.fetch_result().to_table())
+                raise
 
         if async_query:
             return TapQueryResult(self._run_http_async(adql, maxrec=maxrec))
-        return TapQueryResult(self._run_http_sync(adql, maxrec=maxrec))
+
+        try:
+            return TapQueryResult(self._run_http_sync(adql, maxrec=maxrec))
+        except (requests.exceptions.Timeout, RuntimeError, requests.exceptions.HTTPError) as exc:
+            msg = str(exc).lower()
+            if (
+                isinstance(exc, requests.exceptions.Timeout)
+                or "timeout" in msg
+                or "/async" in msg
+                or "504" in msg
+            ):
+                logger.info("Sync TAP query hit timeout; promoting automatically to UWS /async ...")
+                return TapQueryResult(self._run_http_async(adql, maxrec=maxrec))
+            raise
 
     def _run_http_sync(self, adql: str, maxrec: int | None = None) -> Table:
         data: dict[str, Any] = {
@@ -211,59 +240,167 @@ class IVOATapClient:
         resp.raise_for_status()
         return self._parse_votable_bytes(resp.content, adql)
 
+    def _normalize_uws_url(self, raw_url: str, base_url: str) -> str:
+        resolved = urllib.parse.urljoin(base_url, raw_url.strip()).rstrip("/")
+        if self.tap_url.startswith("https://") and resolved.startswith("http://"):
+            tap_host = urllib.parse.urlparse(self.tap_url).netloc
+            res_host = urllib.parse.urlparse(resolved).netloc
+            if res_host == tap_host:
+                resolved = "https://" + resolved[len("http://") :]
+        return resolved
+
+    def _read_uws_phase(self, job_url: str) -> str:
+        p_resp = self._session.get(f"{job_url}/phase", timeout=self.timeout_sec)
+        p_resp.raise_for_status()
+        raw = p_resp.text.strip()
+        if raw.startswith("<"):
+            root = ET.fromstring(p_resp.content)
+            if root.tag.lower().endswith("phase") and root.text:
+                return root.text.strip().upper()
+            for elem in root.iter():
+                if elem.tag.lower().endswith("phase") and elem.text:
+                    return elem.text.strip().upper()
+            return (root.text or "").strip().upper()
+        return raw.upper()
+
+    def _fetch_uws_result_bytes(self, job_url: str) -> bytes:
+        tap_host = urllib.parse.urlparse(self.tap_url).netloc
+        dl_timeout = max(self.timeout_sec, 300.0)
+        target_url = f"{job_url}/results/result"
+
+        r_resp = self._session.get(target_url, allow_redirects=False, timeout=dl_timeout)
+        if r_resp.status_code == 404:
+            res_xml = self._session.get(f"{job_url}/results", timeout=self.timeout_sec)
+            res_xml.raise_for_status()
+            root = ET.fromstring(res_xml.content)
+            href: str | None = None
+            for elem in root.iter():
+                for attr_k, attr_v in elem.attrib.items():
+                    if attr_k.lower().endswith("href") and attr_v:
+                        href = attr_v
+                        break
+                if href:
+                    break
+            if not href:
+                r_resp.raise_for_status()
+            else:
+                next_host = urllib.parse.urlparse(href).netloc
+                if not next_host or next_host == tap_host:
+                    u_norm = self._normalize_uws_url(href, f"{job_url}/results/")
+                    r_resp = self._session.get(u_norm, allow_redirects=False, timeout=dl_timeout)
+                else:
+                    # External signed object-store URL (e.g. GCS on Rubin RSP): omit Bearer header!
+                    r_resp = requests.get(href, allow_redirects=True, timeout=dl_timeout)
+                    r_resp.raise_for_status()
+                    return r_resp.content
+
+        for _ in range(6):
+            if r_resp.status_code not in (301, 302, 303, 307, 308):
+                break
+            loc = r_resp.headers.get("Location")
+            if not loc:
+                break
+            next_url = urllib.parse.urljoin(r_resp.url, loc)
+            next_host = urllib.parse.urlparse(next_url).netloc
+            if next_host == tap_host:
+                next_url = self._normalize_uws_url(next_url, r_resp.url)
+                r_resp = self._session.get(next_url, allow_redirects=False, timeout=dl_timeout)
+            else:
+                # External cloud-storage signed URL (GCS / S3): never forward RSP Bearer header
+                ext_resp = requests.get(next_url, allow_redirects=True, timeout=dl_timeout)
+                ext_resp.raise_for_status()
+                return ext_resp.content
+
+        r_resp.raise_for_status()
+        return r_resp.content
+
     def _run_http_async(self, adql: str, maxrec: int | None = None) -> Table:
-        data: dict[str, Any] = {
+        """Execute strict two-step IVOA UWS 1.1 `/async` job (compatible with Rubin CADC TAP & ESA Gaia TAP)."""
+        create_data: dict[str, Any] = {
             "REQUEST": "doQuery",
             "LANG": "ADQL",
             "FORMAT": "votable",
-            "PHASE": "RUN",
             "QUERY": adql,
         }
         if maxrec is not None:
-            data["MAXREC"] = int(maxrec)
+            create_data["MAXREC"] = int(maxrec)
+
         resp = self._session.post(
             f"{self.tap_url}/async",
-            data=data,
-            allow_redirects=True,
+            data=create_data,
+            allow_redirects=False,
             timeout=self.timeout_sec,
         )
-        resp.raise_for_status()
-        job_url = resp.url.rstrip("/")
-        if job_url.endswith("/phase"):
-            job_url = job_url[: -len("/phase")]
+        if resp.status_code in (301, 302, 303, 307, 308) and "Location" in resp.headers:
+            job_url = self._normalize_uws_url(resp.headers["Location"], f"{self.tap_url}/async/")
+        else:
+            resp.raise_for_status()
+            job_url = self._normalize_uws_url(resp.url, f"{self.tap_url}/async/")
+            if job_url.endswith("/async"):
+                root = ET.fromstring(resp.content)
+                job_id = None
+                for elem in root.iter():
+                    if elem.tag.lower().endswith("jobid") and elem.text:
+                        job_id = elem.text.strip()
+                        break
+                if not job_id:
+                    raise RuntimeError(f"Could not extract UWS jobId from /async response: {resp.text[:400]}")
+                job_url = f"{self.tap_url}/async/{job_id}"
 
-        deadline = time.monotonic() + max(self.timeout_sec, 900.0)
-        sleep_s = 0.5
-        while time.monotonic() < deadline:
-            p_resp = self._session.get(f"{job_url}/phase", timeout=self.timeout_sec)
-            p_resp.raise_for_status()
-            phase = p_resp.text.strip().upper()
-            if "<" in phase:
-                root = ET.fromstring(p_resp.content)
-                phase = (root.text or "").strip().upper()
-            if phase == "COMPLETED":
-                r_resp = self._session.get(
-                    f"{job_url}/results/result", timeout=self.timeout_sec
-                )
-                r_resp.raise_for_status()
-                return self._parse_votable_bytes(r_resp.content, adql)
-            if phase in ("ERROR", "ABORTED"):
-                err_resp = self._session.get(f"{job_url}/error", timeout=self.timeout_sec)
-                raise RuntimeError(
-                    f"TAP async job failed ({phase}): {err_resp.text[:600]} | ADQL={adql}"
-                )
-            time.sleep(sleep_s)
-            sleep_s = min(5.0, sleep_s * 1.4)
+        for suffix in ("/phase", "/results"):
+            if job_url.endswith(suffix):
+                job_url = job_url[: -len(suffix)]
 
-        raise TimeoutError(f"TAP async query timed out at {job_url}")
+        try:
+            phase = self._read_uws_phase(job_url)
+            if phase in ("PENDING", ""):
+                run_resp = self._session.post(
+                    f"{job_url}/phase",
+                    data={"PHASE": "RUN"},
+                    allow_redirects=False,
+                    timeout=self.timeout_sec,
+                )
+                if run_resp.status_code >= 400:
+                    run_resp.raise_for_status()
+
+            deadline = time.monotonic() + max(self.timeout_sec * 6.0, 1200.0)
+            sleep_s = 0.4
+            while time.monotonic() < deadline:
+                phase = self._read_uws_phase(job_url)
+                if phase == "COMPLETED":
+                    payload = self._fetch_uws_result_bytes(job_url)
+                    return self._parse_votable_bytes(payload, adql)
+                if phase in ("ERROR", "ABORTED"):
+                    err_txt = ""
+                    try:
+                        err_resp = self._session.get(f"{job_url}/error", timeout=30.0)
+                        err_txt = err_resp.text[:800]
+                    except Exception:
+                        pass
+                    raise RuntimeError(
+                        f"TAP async job {job_url} ended in {phase}: {err_txt} | ADQL={adql}"
+                    )
+                time.sleep(sleep_s)
+                sleep_s = min(3.0, sleep_s * 1.35)
+
+            raise TimeoutError(f"TAP async query timed out waiting for completion at {job_url}")
+        finally:
+            try:
+                self._session.delete(job_url, timeout=10.0)
+            except Exception:
+                pass
 
     @staticmethod
     def _parse_votable_bytes(payload: bytes, adql: str) -> Table:
         head_txt = payload[:2500].decode("utf-8", errors="ignore")
         if 'QUERY_STATUS" value="ERROR"' in head_txt or " value='ERROR'" in head_txt:
             raise RuntimeError(f"TAP server returned VOTable ERROR for ADQL={adql!r}:\n{head_txt}")
-        vot = parse_single_table(io.BytesIO(payload))
-        return vot.to_table(use_names_over_ids=True)
+        try:
+            vot = parse_single_table(io.BytesIO(payload))
+            return vot.to_table(use_names_over_ids=True)
+        except IndexError:
+            # Valid VOTable response with zero <TABLE> elements
+            return Table()
 
 
 def open_rsp_tap_client(
@@ -576,15 +713,115 @@ def build_tap_ebv_provider(
     return EBVProvider.from_config(cfg.dust)
 
 
-def _fetch_visit_detectors_for_region(
+def _order_quads_ccw_batch(
+    ra_mat: np.ndarray, dec_mat: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """Vectorized counter-clockwise tangent-plane vertex ordering across ``(N, 4)`` CCD quads."""
+    ra_r = np.deg2rad(ra_mat)
+    dec_r = np.deg2rad(dec_mat)
+    cos_d = np.cos(dec_r)
+    vx = cos_d * np.cos(ra_r)
+    vy = cos_d * np.sin(ra_r)
+    vz = np.sin(dec_r)
+
+    cx = vx.mean(axis=1)
+    cy = vy.mean(axis=1)
+    cz = vz.mean(axis=1)
+    norm = np.maximum(np.sqrt(cx * cx + cy * cy + cz * cz), 1e-12)
+    cx /= norm
+    cy /= norm
+    cz /= norm
+
+    ra0 = np.arctan2(cy, cx)
+    dec0 = np.arcsin(np.clip(cz, -1.0, 1.0))
+    sin_ra0 = np.sin(ra0)
+    cos_ra0 = np.cos(ra0)
+    sin_dec0 = np.sin(dec0)
+    cos_dec0 = np.cos(dec0)
+
+    u_east = -vx * sin_ra0[:, None] + vy * cos_ra0[:, None]
+    v_north = (
+        -vx * (sin_dec0 * cos_ra0)[:, None]
+        - vy * (sin_dec0 * sin_ra0)[:, None]
+        + vz * cos_dec0[:, None]
+    )
+    order = np.argsort(np.arctan2(v_north, u_east), axis=1)
+    rows = np.arange(ra_mat.shape[0])[:, None]
+    return np.mod(ra_mat[rows, order], 360.0), np.clip(dec_mat[rows, order], -89.999, 89.999)
+
+
+def _plan_full_dp2_ra_stripes(
+    tap_client: IVOATapClient | "SyntheticDP2TapService",
+    sinfo: TapSchemaInfo,
+    bands: Sequence[str],
+    target_visits_per_stripe: int = 1_200,
+) -> list[tuple[float, float]]:
+    """Query lightweight ``dp2.Visit.ra`` once to build visit-balanced RA stripes across ``[0, 360)``.
+
+    Skips completely empty RA intervals and automatically subdivides ultra-dense Galactic
+    Bulge / WFD zones (such as ``RA = [270, 300)``) into narrow stripes of ~1,200 visits
+    (~225k CCD rows) so every UWS ``/async`` query completes quickly and well below ``MAXREC``.
+    """
+    default_stripes = [(float(lo), float(lo + 15.0)) for lo in range(0, 360, 15)]
+    if getattr(tap_client, "is_synthetic", False):
+        return [(0.0, 360.0)]
+
+    bands_csv = ", ".join(f"'{b}'" for b in bands)
+    try:
+        v_adql = f"SELECT ra FROM {sinfo.visit_table} WHERE band IN ({bands_csv})"
+        v_tbl = tap_client.search(v_adql, maxrec=500_000, async_query=True).to_table()
+        if len(v_tbl) == 0:
+            return default_stripes
+        v_ra = np.sort(np.asarray(v_tbl["ra"], dtype=np.float64) % 360.0)
+        v_ra = v_ra[np.isfinite(v_ra)]
+        if v_ra.size == 0:
+            return default_stripes
+    except Exception as exc:
+        logger.warning("Visit RA pre-scan unavailable (%s); using uniform 15-deg RA stripes.", exc)
+        return default_stripes
+
+    planned: list[tuple[float, float]] = []
+    fov_pad = 3.0  # LSSTCam 3.5 deg FOV half-width + margin for high-|Dec| cos(dec)
+    for base_lo, base_hi in default_stripes:
+        # Check if any visit center lies within +/- fov_pad of [base_lo, base_hi) (mod 360)
+        mid = 0.5 * (base_lo + base_hi)
+        half_span = 0.5 * (base_hi - base_lo) + fov_pad
+        d_ang = np.abs(((v_ra - mid + 180.0) % 360.0) - 180.0)
+        if not np.any(d_ang <= half_span):
+            continue
+
+        in_bin = v_ra[(v_ra >= base_lo) & (v_ra < base_hi)]
+        n_sub = max(1, int(math.ceil(in_bin.size / max(200, int(target_visits_per_stripe)))))
+        if n_sub == 1 or in_bin.size < 2:
+            planned.append((base_lo, base_hi))
+        else:
+            q_edges = np.quantile(in_bin, np.linspace(0.0, 1.0, n_sub + 1))
+            q_edges[0] = base_lo
+            q_edges[-1] = base_hi
+            for k in range(n_sub):
+                lo_k = round(float(q_edges[k]), 5)
+                hi_k = float(base_hi) if k == n_sub - 1 else round(float(q_edges[k + 1]), 5)
+                if hi_k > lo_k + 1e-4:
+                    planned.append((lo_k, hi_k))
+
+    logger.info(
+        "Planned %d visit-balanced RA stripes across %d DP2 visits (target <= %d visits/stripe)",
+        len(planned),
+        int(v_ra.size),
+        int(target_visits_per_stripe),
+    )
+    return planned if planned else default_stripes
+
+
+def _iter_visit_detector_tables(
     tap_client: IVOATapClient | "SyntheticDP2TapService",
     cfg: MaskPipelineConfig,
     sinfo: TapSchemaInfo,
     bands: Sequence[str],
-) -> pd.DataFrame:
-    """Query ``dp2.VisitDetector`` rows: single sync query for ``cone``/``box``, or RA-striped
-    chunks across ``[0, 360)`` for ``region.mode == 'full'`` so multi-million-row full-survey
-    DP2 queries stay bounded in memory and never hit TAP ``MAXREC`` truncation.
+) -> Iterator[pd.DataFrame]:
+    """Stream ``dp2.VisitDetector`` chunks: single query for ``cone``/``box``, or visit-balanced
+    UWS ``/async`` RA stripes (with automatic bisection if ``MAXREC`` is ever reached) for
+    ``region.mode == 'full'`` so multi-million-row DP2 surveys never time out or truncate.
     """
     bands_csv = ", ".join(f"'{b}'" for b in bands)
     band_expr = "vd.band" if sinfo.vd_has_band else "v.band"
@@ -607,27 +844,49 @@ def _fetch_visit_detectors_for_region(
         where_spatial = _adql_spatial_clause(cfg, "vd.ra", "vd.dec", pad_deg=0.30)
         adql = f"{select_cols} WHERE {band_expr} IN ({bands_csv}) AND ({where_spatial})"
         tbl = tap_client.search(adql, maxrec=1_000_000).to_table()
-        return tbl.to_pandas() if len(tbl) > 0 else pd.DataFrame()
+        if len(tbl) > 0:
+            yield tbl.to_pandas()
+        return
 
-    # Full-survey DP2 mode: stream 12 x 30-degree RA stripes across [0, 360)
-    dfs: list[pd.DataFrame] = []
-    stripe_deg = 30.0
-    for ra_lo in np.arange(0.0, 360.0, stripe_deg):
-        ra_hi = ra_lo + stripe_deg
+    stripe_maxrec = 1_000_000
+    queue = list(_plan_full_dp2_ra_stripes(tap_client, sinfo, bands))
+    total_initial = len(queue)
+    done_idx = 0
+    while queue:
+        ra_lo, ra_hi = queue.pop(0)
+        done_idx += 1
         adql = (
             f"{select_cols} "
             f"WHERE {band_expr} IN ({bands_csv}) "
-            f"AND (vd.ra >= {ra_lo:.4f} AND vd.ra < {ra_hi:.4f})"
+            f"AND (vd.ra >= {ra_lo:.5f} AND vd.ra < {ra_hi:.5f})"
         )
-        logger.info("Querying full-DP2 TAP %s stripe RA=[%.0f, %.0f) deg ...", sinfo.visit_detector_table, ra_lo, ra_hi)
-        try:
-            tbl = tap_client.search(adql, maxrec=1_500_000, async_query=True).to_table()
-        except Exception:
-            tbl = tap_client.search(adql, maxrec=1_500_000, async_query=False).to_table()
+        logger.info(
+            "Querying full-DP2 TAP %s stripe %d/%d: RA=[%.2f, %.2f) deg (UWS /async) ...",
+            sinfo.visit_detector_table,
+            done_idx,
+            max(done_idx + len(queue), total_initial),
+            ra_lo,
+            ra_hi,
+        )
+        tbl = tap_client.search(adql, maxrec=stripe_maxrec, async_query=True).to_table()
+        if len(tbl) >= stripe_maxrec and (ra_hi - ra_lo) > 0.05:
+            ra_mid = 0.5 * (ra_lo + ra_hi)
+            logger.warning(
+                "Stripe RA=[%.2f, %.2f) hit MAXREC=%d; bisecting into [%.2f, %.2f) and [%.2f, %.2f)!",
+                ra_lo,
+                ra_hi,
+                stripe_maxrec,
+                ra_lo,
+                ra_mid,
+                ra_mid,
+                ra_hi,
+            )
+            queue.insert(0, (ra_mid, ra_hi))
+            queue.insert(0, (ra_lo, ra_mid))
+            continue
         if len(tbl) > 0:
-            dfs.append(tbl.to_pandas())
-
-    return pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
+            yield tbl.to_pandas()
+        del tbl
 
 
 def build_tap_property_mask(
@@ -650,10 +909,10 @@ def build_tap_property_mask(
     pm = cfg.property_maps
     sinfo = schema_info or discover_dp2_tap_schema(tap_client)
 
-    # On wide full-survey runs, LSSTCam CCDs (~0.22 deg = 800") are completely resolved at order 13
-    # (25.8" pixels), saving 16x polygon-rasterization RAM/CPU while `combine` outputs `order_out` (15).
+    # On wide full-survey runs, LSSTCam CCDs (~0.22 deg = 800") span ~16x16 pixels at order 12
+    # (51.5" pixels), saving 64x polygon-rasterization RAM/CPU while `combine` outputs `order_out` (15).
     raw_order_sparse = int(pm.order_sparse)
-    order_sparse = min(raw_order_sparse, 13) if cfg.region.mode == "full" else raw_order_sparse
+    order_sparse = min(raw_order_sparse, 12) if cfg.region.mode == "full" else raw_order_sparse
     order_cov = int(pm.order_cov)
     nside_sparse = 1 << order_sparse
     nside_cov = 1 << order_cov
@@ -675,15 +934,11 @@ def build_tap_property_mask(
     )
 
     logger.info(
-        "Querying TAP %s detector pointings across bands=%s (order_sparse=%d) ...",
+        "Streaming TAP %s detector pointings across bands=%s (order_sparse=%d) ...",
         sinfo.visit_detector_table,
         pm.bands,
         order_sparse,
     )
-    vd_df = _fetch_visit_detectors_for_region(tap_client, cfg, sinfo, pm.bands)
-    logger.info("Retrieved %d detector-visit rows from TAP %s", len(vd_df), sinfo.visit_detector_table)
-    if "band" in vd_df.columns:
-        vd_df["band"] = vd_df["band"].astype(str).str.strip()
 
     # Optional IVOA ObsCore deep_coadd patch polygon constraint (calib_level=3) on regional runs
     obscore_valid_by_band: dict[str, np.ndarray] = {}
@@ -727,6 +982,133 @@ def build_tap_property_mask(
             )
         )
 
+    # Stream each TAP stripe directly into compact per-band HEALPix accumulators (22 B/pixel)
+    # so multi-million-row DP2 VisitDetector tables are never concatenated together in RAM!
+    band_accum: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = {
+        b: (
+            np.empty(0, dtype=np.int64),
+            np.empty(0, dtype=np.int16),
+            np.empty(0, dtype=np.float32),
+            np.empty(0, dtype=np.float32),
+            np.empty(0, dtype=np.float32),
+        )
+        for b in pm.bands
+    }
+    total_vd_rows = 0
+
+    for stripe_df in _iter_visit_detector_tables(tap_client, cfg, sinfo, pm.bands):
+        total_vd_rows += len(stripe_df)
+        if "band" in stripe_df.columns:
+            stripe_df["band"] = stripe_df["band"].astype(str).str.strip()
+        has_corners = all(
+            c in stripe_df.columns
+            for c in ("llcra", "llcdec", "ulcra", "ulcdec", "urcra", "urcdec", "lrcra", "lrcdec")
+        )
+
+        for band in pm.bands:
+            sub = stripe_df[stripe_df["band"] == band]
+            if len(sub) == 0:
+                continue
+            crit = pm.per_band.get(band, BandCriteria())
+            exptimes = sub["expTime"].to_numpy(dtype=np.float64)
+            maglims = sub["magLim"].to_numpy(dtype=np.float64)
+            seeings = sub["seeing"].to_numpy(dtype=np.float64)
+            ras = sub["ra"].to_numpy(dtype=np.float64)
+            decs = sub["dec"].to_numpy(dtype=np.float64)
+
+            if has_corners:
+                c_ra_raw = np.column_stack(
+                    [sub["llcra"], sub["ulcra"], sub["urcra"], sub["lrcra"]]
+                ).astype(np.float64)
+                c_dec_raw = np.column_stack(
+                    [sub["llcdec"], sub["ulcdec"], sub["urcdec"], sub["lrcdec"]]
+                ).astype(np.float64)
+                finite_quad = np.all(np.isfinite(c_ra_raw), axis=1) & np.all(
+                    np.isfinite(c_dec_raw), axis=1
+                )
+                c_ra_ord = np.empty_like(c_ra_raw)
+                c_dec_ord = np.empty_like(c_dec_raw)
+                if np.any(finite_quad):
+                    c_ra_ord[finite_quad], c_dec_ord[finite_quad] = _order_quads_ccw_batch(
+                        c_ra_raw[finite_quad], c_dec_raw[finite_quad]
+                    )
+            else:
+                finite_quad = np.zeros(len(sub), dtype=bool)
+                c_ra_ord = c_dec_ord = np.empty((0, 4))
+
+            acc_pix, acc_nexp, acc_et, acc_w, acc_sw = band_accum[band]
+            det_batch = 15_000
+            for b_start in range(0, len(sub), det_batch):
+                b_end = min(len(sub), b_start + det_batch)
+                pix_chunks: list[np.ndarray] = []
+                exp_chunks: list[np.ndarray] = []
+                wt_chunks: list[np.ndarray] = []
+                see_wt_chunks: list[np.ndarray] = []
+
+                for i in range(b_start, b_end):
+                    ml_i = maglims[i]
+                    if not np.isfinite(ml_i):
+                        continue
+                    et_i = (
+                        exptimes[i]
+                        if np.isfinite(exptimes[i]) and exptimes[i] > 0
+                        else float(crit.nominal_exptime_sec)
+                    )
+                    if finite_quad[i]:
+                        try:
+                            dpix = hpg.query_polygon(
+                                nside_sparse, c_ra_ord[i], c_dec_ord[i], nest=True, degrees=True
+                            )
+                        except Exception:
+                            dpix = _rasterize_convex_quad(nside_sparse, c_ra_ord[i], c_dec_ord[i])
+                    elif np.isfinite(ras[i]) and np.isfinite(decs[i]):
+                        cos_d = max(math.cos(math.radians(decs[i])), 0.1)
+                        hw = 0.1135 / cos_d
+                        hh = 0.1135
+                        dpix = _rasterize_convex_quad(
+                            nside_sparse,
+                            np.array([ras[i] - hw, ras[i] + hw, ras[i] + hw, ras[i] - hw]),
+                            np.array([decs[i] - hh, decs[i] - hh, decs[i] + hh, decs[i] + hh]),
+                        )
+                    else:
+                        continue
+
+                    if dpix.size == 0:
+                        continue
+                    w_i = 10.0 ** (0.8 * (ml_i - 25.0))
+                    s_i = seeings[i] if np.isfinite(seeings[i]) else 1.0
+                    pix_chunks.append(dpix)
+                    exp_chunks.append(np.full(dpix.size, et_i, dtype=np.float64))
+                    wt_chunks.append(np.full(dpix.size, w_i, dtype=np.float64))
+                    see_wt_chunks.append(np.full(dpix.size, w_i * s_i, dtype=np.float64))
+
+                if not pix_chunks:
+                    continue
+
+                cat_p = np.concatenate([acc_pix, *pix_chunks])
+                cat_n = np.concatenate(
+                    [acc_nexp.astype(np.int32), np.ones(sum(c.size for c in pix_chunks), dtype=np.int32)]
+                )
+                cat_et = np.concatenate([acc_et.astype(np.float64), *exp_chunks])
+                cat_w = np.concatenate([acc_w.astype(np.float64), *wt_chunks])
+                cat_sw = np.concatenate([acc_sw.astype(np.float64), *see_wt_chunks])
+                del pix_chunks, exp_chunks, wt_chunks, see_wt_chunks
+
+                acc_pix, inv_idx = np.unique(cat_p, return_inverse=True)
+                acc_nexp = np.minimum(np.bincount(inv_idx, weights=cat_n), 32_000).astype(np.int16)
+                acc_et = np.bincount(inv_idx, weights=cat_et).astype(np.float32)
+                acc_w = np.bincount(inv_idx, weights=cat_w).astype(np.float32)
+                acc_sw = np.bincount(inv_idx, weights=cat_sw).astype(np.float32)
+                del cat_p, cat_n, cat_et, cat_w, cat_sw, inv_idx
+
+            band_accum[band] = (acc_pix, acc_nexp, acc_et, acc_w, acc_sw)
+
+        del stripe_df
+        gc.collect()
+        guard.check(f"TAP stripe accumulated ({total_vd_rows:,} VisitDetector rows processed)")
+
+    logger.info("Accumulated %d total detector-visit rows from TAP %s", total_vd_rows, sinfo.visit_detector_table)
+
     per_band_area: dict[str, float] = {}
     coadd_maps: dict[str, hsp.HealSparseMap] = {}
     n_pass_map = hsp.HealSparseMap.make_empty(nside_cov, nside_sparse, dtype=np.int16, sentinel=0)
@@ -735,105 +1117,13 @@ def build_tap_property_mask(
 
     for band in pm.bands:
         crit = pm.per_band.get(band, BandCriteria())
-        sub = vd_df[vd_df["band"] == band] if len(vd_df) > 0 else pd.DataFrame()
-
-        if len(sub) == 0:
-            per_band_area[band] = 0.0
-            empty_b = hsp.HealSparseMap.make_empty(nside_cov, nside_sparse, dtype=np.bool_, bit_packed=True)
-            if pm.keep_per_band_stages:
-                setattr(pipe, f"prop_{band}_mask", empty_b)
-            if band in req_bands:
-                req_pass_maps[band] = empty_b
-            continue
-
-        has_corners = all(
-            c in sub.columns
-            for c in ("llcra", "llcdec", "ulcra", "ulcdec", "urcra", "urcdec", "lrcra", "lrcdec")
-        )
-        exptimes = sub["expTime"].to_numpy(dtype=np.float64)
-        maglims = sub["magLim"].to_numpy(dtype=np.float64)
-        seeings = sub["seeing"].to_numpy(dtype=np.float64)
-        ras = sub["ra"].to_numpy(dtype=np.float64)
-        decs = sub["dec"].to_numpy(dtype=np.float64)
-
-        if has_corners:
-            c_ra_mat = np.column_stack(
-                [sub["llcra"], sub["ulcra"], sub["urcra"], sub["lrcra"]]
-            ).astype(np.float64)
-            c_dec_mat = np.column_stack(
-                [sub["llcdec"], sub["ulcdec"], sub["urcdec"], sub["lrcdec"]]
-            ).astype(np.float64)
-        else:
-            c_ra_mat = c_dec_mat = np.empty((0, 4))
-
-        # Stream-accumulate detector polygons in chunks of 15,000 CCDs so memory stays < 1 GiB!
-        acc_pix = np.empty(0, dtype=np.int64)
-        acc_nexp = np.empty(0, dtype=np.int32)
-        acc_et = np.empty(0, dtype=np.float64)
-        acc_w = np.empty(0, dtype=np.float64)
-        acc_sw = np.empty(0, dtype=np.float64)
-
-        det_batch = 15_000
-        for b_start in range(0, len(sub), det_batch):
-            b_end = min(len(sub), b_start + det_batch)
-            pix_chunks: list[np.ndarray] = []
-            exp_chunks: list[np.ndarray] = []
-            wt_chunks: list[np.ndarray] = []
-            see_wt_chunks: list[np.ndarray] = []
-
-            for i in range(b_start, b_end):
-                ml_i = maglims[i]
-                et_i = (
-                    exptimes[i]
-                    if np.isfinite(exptimes[i]) and exptimes[i] > 0
-                    else float(crit.nominal_exptime_sec)
-                )
-                if not np.isfinite(ml_i):
-                    continue
-
-                if has_corners and np.all(np.isfinite(c_ra_mat[i])) and np.all(np.isfinite(c_dec_mat[i])):
-                    dpix = _rasterize_convex_quad(nside_sparse, c_ra_mat[i], c_dec_mat[i])
-                elif np.isfinite(ras[i]) and np.isfinite(decs[i]):
-                    cos_d = max(math.cos(math.radians(decs[i])), 0.1)
-                    hw = 0.1135 / cos_d
-                    hh = 0.1135
-                    dpix = _rasterize_convex_quad(
-                        nside_sparse,
-                        np.array([ras[i] - hw, ras[i] + hw, ras[i] + hw, ras[i] - hw]),
-                        np.array([decs[i] - hh, decs[i] - hh, decs[i] + hh, decs[i] + hh]),
-                    )
-                else:
-                    continue
-
-                if dpix.size == 0:
-                    continue
-                w_i = 10.0 ** (0.8 * (ml_i - 25.0))
-                s_i = seeings[i] if np.isfinite(seeings[i]) else 1.0
-                pix_chunks.append(dpix)
-                exp_chunks.append(np.full(dpix.size, et_i, dtype=np.float64))
-                wt_chunks.append(np.full(dpix.size, w_i, dtype=np.float64))
-                see_wt_chunks.append(np.full(dpix.size, w_i * s_i, dtype=np.float64))
-
-            if not pix_chunks:
-                continue
-
-            cat_p = np.concatenate([acc_pix, *pix_chunks])
-            cat_n = np.concatenate([acc_nexp, np.ones(sum(c.size for c in pix_chunks), dtype=np.int32)])
-            cat_et = np.concatenate([acc_et, *exp_chunks])
-            cat_w = np.concatenate([acc_w, *wt_chunks])
-            cat_sw = np.concatenate([acc_sw, *see_wt_chunks])
-            del pix_chunks, exp_chunks, wt_chunks, see_wt_chunks
-
-            acc_pix, inv_idx = np.unique(cat_p, return_inverse=True)
-            acc_nexp = np.bincount(inv_idx, weights=cat_n).astype(np.int32)
-            acc_et = np.bincount(inv_idx, weights=cat_et)
-            acc_w = np.bincount(inv_idx, weights=cat_w)
-            acc_sw = np.bincount(inv_idx, weights=cat_sw)
-            del cat_p, cat_n, cat_et, cat_w, cat_sw, inv_idx
+        acc_pix, acc_nexp, acc_et, acc_w, acc_sw = band_accum.pop(band)
 
         if acc_pix.size == 0:
             per_band_area[band] = 0.0
             empty_b = hsp.HealSparseMap.make_empty(nside_cov, nside_sparse, dtype=np.bool_, bit_packed=True)
+            if pm.keep_per_band_stages:
+                setattr(pipe, f"prop_{band}_mask", empty_b)
             if band in req_bands:
                 req_pass_maps[band] = empty_b
             continue
@@ -1028,10 +1318,10 @@ def _compute_star_query_clauses(
         if c_ra.size == 0:
             return []
 
-    nside_cone = 4  # 192 sky cells across 4pi; max corner radius ~ 11.2 deg
+    nside_cone = 8  # 768 sky cells across 4pi; max corner radius ~ 5.8 deg (~108 deg^2/cone)
     cone_ids = np.unique(hpg.angle_to_pixel(nside_cone, c_ra, c_dec, nest=True, degrees=True))
     q_ra, q_dec = hpg.pixel_to_angle(nside_cone, cone_ids, nest=True, degrees=True)
-    cone_rad = 11.5 + float(buffer_deg)
+    cone_rad = float(hpg.max_pixel_radius(nside_cone, degrees=True)) + 0.35 + float(buffer_deg)
     return [
         f"CONTAINS(POINT('ICRS', ra, dec), CIRCLE('ICRS', {float(r0):.5f}, {float(d0):.5f}, {cone_rad:.5f})) = 1"
         for r0, d0 in zip(q_ra, q_dec)
@@ -1105,7 +1395,24 @@ def build_local_tap_star_mask(
                 f"WHERE ({where_clause}) AND phot_g_mean_mag <= {g_cut:.3f}"
             )
             try:
-                g_tbl = gaia_tap_client.search(adql_gaia, maxrec=1_500_000).to_table()
+                g_tbl = None
+                last_gaia_err: Exception | None = None
+                for attempt in range(3):
+                    try:
+                        g_tbl = gaia_tap_client.search(
+                            adql_gaia,
+                            maxrec=1_500_000,
+                            async_query=(attempt >= 1 and not getattr(gaia_tap_client, "is_synthetic", False)),
+                        ).to_table()
+                        break
+                    except Exception as g_exc:
+                        last_gaia_err = g_exc
+                        if getattr(gaia_tap_client, "is_synthetic", False):
+                            raise
+                        time.sleep(1.0 * (attempt + 1))
+                if g_tbl is None:
+                    assert last_gaia_err is not None
+                    raise last_gaia_err
                 ra_deg = np.asarray(g_tbl["ra"], dtype=np.float64) % 360.0
                 dec_deg = np.asarray(g_tbl["dec"], dtype=np.float64)
                 g_mag = np.asarray(g_tbl["phot_g_mean_mag"], dtype=np.float64)
@@ -1300,7 +1607,7 @@ class DP2LocalTapMaskBuilder:
 
     def estimate_memory(self, assumed_area_deg2: float = 6000.0) -> dict[str, float]:
         eff_prop_order = (
-            min(int(self.cfg.property_maps.order_sparse), 13)
+            min(int(self.cfg.property_maps.order_sparse), 12)
             if self.cfg.region.mode == "full"
             else int(self.cfg.property_maps.order_sparse)
         )

@@ -66,6 +66,48 @@ class TestLocalTapPipeline(unittest.TestCase):
                 self.assertEqual(len(out), 2)
                 self.assertAlmostEqual(float(out["ra"][0]), 53.1, places=4)
 
+            # Verify sync timeout auto-promotes to strict 2-step UWS 1.1 /async + external GCS signed URL
+            timeout_xml = (
+                b'<?xml version="1.0"?><VOTABLE version="1.3"><RESOURCE type="results">'
+                b'<INFO name="QUERY_STATUS" value="ERROR">'
+                b"Query timeout exceeded for synchronous execution. Please use /async endpoint."
+                b"</INFO></RESOURCE></VOTABLE>"
+            )
+            sync_err_resp = mock.MagicMock(status_code=200, content=timeout_xml)
+            sync_err_resp.raise_for_status.return_value = None
+
+            create_resp = mock.MagicMock(
+                status_code=303,
+                headers={"Location": "http://data.lsst.cloud/api/tap/async/job99"},
+                url="https://data.lsst.cloud/api/tap/async",
+            )
+            run_resp = mock.MagicMock(status_code=303, headers={"Location": "https://data.lsst.cloud/api/tap/async/job99"})
+            phase_pending = mock.MagicMock(status_code=200, text="PENDING", content=b"PENDING")
+            phase_pending.raise_for_status.return_value = None
+            phase_done = mock.MagicMock(status_code=200, text="COMPLETED", content=b"COMPLETED")
+            phase_done.raise_for_status.return_value = None
+            redir_gcs = mock.MagicMock(
+                status_code=303,
+                headers={"Location": "https://storage.googleapis.com/rubin-tap/res.vot?sig=abc"},
+                url="https://data.lsst.cloud/api/tap/async/job99/results/result",
+            )
+            gcs_ok = mock.MagicMock(status_code=200, content=buf.getvalue())
+            gcs_ok.raise_for_status.return_value = None
+
+            with (
+                mock.patch.object(client._session, "post", side_effect=[sync_err_resp, create_resp, run_resp]) as m_post,
+                mock.patch.object(client._session, "get", side_effect=[phase_pending, phase_done, redir_gcs]),
+                mock.patch.object(client._session, "delete") as m_del,
+                mock.patch("requests.get", return_value=gcs_ok) as m_ext_get,
+            ):
+                promoted = client.search("SELECT ra, dec FROM dp2.VisitDetector", maxrec=100).to_table()
+                self.assertEqual(len(promoted), 2)
+                # Initial /async creation POST must NOT include PHASE=RUN; 2nd POST starts /phase
+                self.assertNotIn("PHASE", m_post.call_args_list[1].kwargs["data"])
+                self.assertEqual(m_post.call_args_list[2].kwargs["data"], {"PHASE": "RUN"})
+                m_ext_get.assert_called_once()
+                m_del.assert_called_once()
+
     def test_stcs_parsing_and_gaia_lsst_color_locus(self) -> None:
         poly_pix = parse_stcs_region_pixels(
             "POLYGON ICRS 53.0 -28.2 53.3 -28.2 53.3 -27.9 53.0 -27.9",
